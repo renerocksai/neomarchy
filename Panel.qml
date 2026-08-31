@@ -39,19 +39,41 @@ Item {
         service.refreshFavorites(false)
     }
     Qt.callLater(focusSearch)
-    Qt.callLater(revealCurrent)
+    requestReveal()
   }
 
   // Land on the session that is playing rather than the top of the list.
+  // Returns false while it still has work to do.
   function revealCurrent() {
     if (!service || service.trackId === "" || searching)
-      return
+      return true
     for (var i = 0; i < items.length; i++) {
       if (String(items[i].id) === service.trackId) {
         selectedIndex = i
         list.positionViewAtIndex(i, ListView.Contain)
-        return
+        return list.contentHeight > 0
       }
+    }
+    return false
+  }
+
+  function requestReveal() {
+    revealAttempts = 0
+    revealTimer.restart()
+  }
+
+  property int revealAttempts: 0
+
+  // The favorites arrive a beat after the window opens, and the list needs a
+  // layout pass before it can position itself — so keep trying briefly.
+  Timer {
+    id: revealTimer
+    interval: 120
+    repeat: true
+    onTriggered: {
+      root.revealAttempts++
+      if (root.revealCurrent() || root.revealAttempts >= 10)
+        stop()
     }
   }
 
@@ -129,7 +151,7 @@ Item {
     // The favorites usually arrive after the window is already open, so the
     // reveal has to run again once there is actually something to reveal.
     if (opened)
-      Qt.callLater(revealCurrent)
+      requestReveal()
   }
 
   // ------------------------------------------------------------------ view
@@ -227,7 +249,7 @@ Item {
             spacing: Style.spacing.xxs
 
             Text {
-              text: "neowake"
+              text: "neomarchy"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
@@ -573,6 +595,10 @@ Item {
             cacheBuffer: Style.space(180)
             keyNavigationEnabled: false
             currentIndex: root.selectedIndex
+
+            // Resizing the window changes how many rows fit, which can push the
+            // playing session out of view — put it back.
+            onHeightChanged: if (root.opened) root.requestReveal()
             ScrollBar.vertical: ScrollBar {}
 
             delegate: SessionRow {
@@ -821,7 +847,7 @@ Item {
     target: root.service
     function onTrackIdChanged() {
       if (root.opened)
-        Qt.callLater(root.revealCurrent)
+        root.requestReveal()
     }
   }
 

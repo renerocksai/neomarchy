@@ -38,15 +38,15 @@ Everything is already on a stock Omarchy box:
 ## Install
 
 ```bash
-git clone https://github.com/renerocksai/neomarchy ~/code/neomarchy
-ln -sfn ~/code/neomarchy ~/.config/omarchy/plugins/org.renerocksai.neomarchy
-omarchy plugin validate ~/code/neomarchy   # the real directory, not the symlink
-omarchy-shell shell rescanPlugins
-omarchy plugin enable org.renerocksai.neomarchy --section right
+omarchy plugin add https://github.com/renerocksai/neomarchy --enable
 ```
 
-`omarchy plugin add` only takes a git URL and clones a real directory; the
-symlink above is the local-development variant of the same thing.
+That clones the repo into `~/.config/omarchy/plugins/org.renerocksai.neomarchy/`
+and asks where to put the bar widget. Without `--enable` it lands disabled so
+you can read the code first — plugins run unsandboxed inside `omarchy-shell`.
+
+Later: `omarchy plugin update org.renerocksai.neomarchy` (shows a diff and
+fast-forwards), `omarchy plugin remove org.renerocksai.neomarchy`.
 
 ## Sign in
 
@@ -174,13 +174,22 @@ in the keyring.
 
 ## Developing
 
-Omarchy watches `~/.config/omarchy/plugins` with `inotifywait -r`, which does
-**not** follow symlinks — so when the plugin directory is a symlink to a repo
-elsewhere, saving a file does not hot-reload it. After an edit:
+The installed plugin directory **is** the git checkout — that is how Omarchy
+plugins work — so hack on it in place:
 
 ```bash
-omarchy restart shell
+cd ~/.config/omarchy/plugins/org.renerocksai.neomarchy
 ```
+
+Saving any file under `~/.config/omarchy/plugins/` hot-reloads the plugin code;
+no restart. `omarchy-shell shell rescanPlugins` forces it, and
+`omarchy plugin validate .` checks the manifest.
+
+> Do **not** move the checkout elsewhere and symlink it in. The watcher uses
+> `inotifywait -r`, which does not follow symlinks, so nothing would ever
+> reload — and `omarchy plugin validate` rejects symlinks inside a plugin
+> folder. A symlink pointing *at* the plugin directory from somewhere else is
+> fine.
 
 QML errors go to the journal:
 
