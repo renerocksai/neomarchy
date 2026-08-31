@@ -41,6 +41,7 @@ BarWidget {
     service.refreshStatus()
     if (service.loggedIn)
       service.refreshFavorites(false)
+    Qt.callLater(function() { favList.revealCurrent() })
   }
 
   onServiceChanged: if (service) service.cacheOnPlay = setting("cacheOnPlay", "Off") === "On"
@@ -504,6 +505,27 @@ BarWidget {
         spacing: Style.spacing.xxs
         reuseItems: true
         boundsBehavior: Flickable.StopAtBounds
+
+        // Keep the session that is actually playing in view, so opening the
+        // popup mid-session shows it rather than the top of the list.
+        readonly property int currentFavorite: {
+          if (!root.service || root.service.trackId === "")
+            return -1
+          var favs = root.service.favorites
+          for (var i = 0; i < favs.length; i++) {
+            if (String(favs[i].id) === root.service.trackId)
+              return i
+          }
+          return -1
+        }
+
+        function revealCurrent() {
+          if (currentFavorite >= 0)
+            positionViewAtIndex(currentFavorite, ListView.Contain)
+        }
+
+        onCurrentFavoriteChanged: revealCurrent()
+        onCountChanged: Qt.callLater(revealCurrent)
 
         delegate: Rectangle {
           id: favRow

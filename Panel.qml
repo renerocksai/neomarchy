@@ -39,6 +39,20 @@ Item {
         service.refreshFavorites(false)
     }
     Qt.callLater(focusSearch)
+    Qt.callLater(revealCurrent)
+  }
+
+  // Land on the session that is playing rather than the top of the list.
+  function revealCurrent() {
+    if (!service || service.trackId === "" || searching)
+      return
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i].id) === service.trackId) {
+        selectedIndex = i
+        list.positionViewAtIndex(i, ListView.Contain)
+        return
+      }
+    }
   }
 
   function close() {
@@ -109,7 +123,14 @@ Item {
     list.positionViewAtIndex(next, ListView.Contain)
   }
 
-  onItemsChanged: if (selectedIndex >= items.length) selectedIndex = items.length - 1
+  onItemsChanged: {
+    if (selectedIndex >= items.length)
+      selectedIndex = items.length - 1
+    // The favorites usually arrive after the window is already open, so the
+    // reveal has to run again once there is actually something to reveal.
+    if (opened)
+      Qt.callLater(revealCurrent)
+  }
 
   // ------------------------------------------------------------------ view
 
@@ -540,7 +561,10 @@ Item {
 
           ListView {
             id: list
-            anchors.fill: parent
+            anchors.top: sectionHeader.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
             visible: root.loggedIn && root.items.length > 0
             model: root.items
             clip: true
@@ -791,6 +815,14 @@ Item {
     service.login(userField.text.trim(), passField.text,
       otpField.visible ? otpField.text.trim() : "")
     passField.text = ""
+  }
+
+  Connections {
+    target: root.service
+    function onTrackIdChanged() {
+      if (root.opened)
+        Qt.callLater(root.revealCurrent)
+    }
   }
 
   Timer {

@@ -3,6 +3,8 @@
 Search, favorite and play [neowake](https://app.neowake.de/) sessions from the
 Omarchy status bar — without opening a browser.
 
+![The bar widget](docs/bar-widget.png)
+
 - **Bar widget** with the neowake mark, the running session's title, and a mini
   player that lists your favorites so you can start one in two clicks.
 - **Panel** (`Super`-summonable) with four search modes, your favorites, cover
@@ -11,6 +13,17 @@ Omarchy status bar — without opening a browser.
   keys work, and any other MPRIS client sees the session.
 - **Favorites** are read from and written back to your neowake account.
 - **Offline**: keep a session on disk and it plays from there next time.
+
+## Screenshots
+
+Click the bar icon for the mini player — now playing plus your favorites, with
+the running session kept in view:
+
+<img src="docs/mini-player.png" alt="The mini player" width="360">
+
+The panel adds search, per-row actions and a persistent now-playing footer:
+
+![The panel](docs/panel.png)
 
 ## Requirements
 
