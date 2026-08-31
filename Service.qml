@@ -52,6 +52,9 @@ Item {
   property real volume: 0.7
   property bool repeat: false
   property bool mpvRunning: false
+  // mpvRunning only says the process is alive. At end of file mpv unloads the
+  // track and idles, so the controls need to know a file is actually loaded.
+  property bool fileLoaded: false
 
   property string statusMessage: ""
   property string lastError: ""
@@ -508,7 +511,7 @@ Item {
   function togglePlayback() {
     if (!hasTrack)
       return
-    if (!mpvRunning) {
+    if (!mpvRunning || !fileLoaded) {
       play(currentTrack)
       return
     }
@@ -519,15 +522,19 @@ Item {
     if (!mpvRunning)
       return
     sendMpv(["stop"])
+    fileLoaded = false
     playing = false
     buffering = false
     positionSeconds = 0
   }
 
   function seekSeconds(value) {
-    if (!mpvRunning || lengthSeconds <= 0)
+    if (!mpvRunning || !fileLoaded || lengthSeconds <= 0)
       return
-    var target = Math.max(0, Math.min(lengthSeconds, value))
+    // Landing exactly on the duration ends the file, so keep a little headroom
+    // at the right edge of the slider.
+    var limit = Math.max(0, lengthSeconds - 1)
+    var target = Math.max(0, Math.min(limit, value))
     positionSeconds = target
     sendMpv(["seek", target, "absolute"])
   }
@@ -592,6 +599,7 @@ Item {
     onStarted: root.mpvRunning = true
     onExited: {
       root.mpvRunning = false
+      root.fileLoaded = false
       root.playing = false
       root.buffering = false
       mpvSocket.connected = false
@@ -649,7 +657,7 @@ Item {
 
     if (message.event === "property-change") {
       if (message.name === "pause") {
-        playing = message.data === false
+        playing = fileLoaded && message.data === false
         if (playing)
           buffering = false
       } else if (message.name === "duration") {
@@ -668,13 +676,16 @@ Item {
     }
 
     if (message.event === "file-loaded") {
+      fileLoaded = true
       buffering = false
       playing = true
       return
     }
     if (message.event === "end-file") {
+      fileLoaded = false
       playing = false
       buffering = false
+      positionSeconds = 0
       if (message.reason === "error")
         fail("Playback failed — the session could not be streamed")
       return
