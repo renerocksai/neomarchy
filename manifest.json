@@ -1,10 +1,14 @@
 {
   "schemaVersion": 1,
-  "id": "org.renerocksai.neowake",
-  "name": "neowake",
+  "id": "org.renerocksai.neomarchy",
+  "name": "neomarchy",
   "version": "0.1.0",
   "description": "Search, favorite and play neowake sessions from the bar.",
-  "kinds": ["service", "bar-widget", "panel"],
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "service": "Service.qml",
@@ -12,7 +16,7 @@
     "panel": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "neowake",
+    "displayName": "neomarchy",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -30,7 +34,10 @@
         "key": "showTrackTitle",
         "type": "enum",
         "label": "Show session title in the bar",
-        "options": ["On", "Off"]
+        "options": [
+          "On",
+          "Off"
+        ]
       },
       {
         "key": "maxBarTextWidth",
@@ -41,19 +48,30 @@
         "key": "defaultSearchMode",
         "type": "enum",
         "label": "Search tab opened by default",
-        "options": ["keyword", "local", "ai", "frequency"]
+        "options": [
+          "keyword",
+          "local",
+          "ai",
+          "frequency"
+        ]
       },
       {
         "key": "repeat",
         "type": "enum",
         "label": "Repeat the running session",
-        "options": ["Off", "On"]
+        "options": [
+          "Off",
+          "On"
+        ]
       },
       {
         "key": "cacheOnPlay",
         "type": "enum",
         "label": "Keep played sessions offline",
-        "options": ["Off", "On"]
+        "options": [
+          "Off",
+          "On"
+        ]
       },
       {
         "key": "volumeStep",

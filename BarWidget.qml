@@ -7,10 +7,10 @@ import qs.Commons
 
 BarWidget {
   id: root
-  moduleName: "org.renerocksai.neowake"
+  moduleName: "org.renerocksai.neomarchy"
 
   readonly property var service: bar && bar.shell
-    ? bar.shell.firstPartyServiceFor("org.renerocksai.neowake") : null
+    ? bar.shell.firstPartyServiceFor("org.renerocksai.neomarchy") : null
 
   readonly property bool showTitle: setting("showTrackTitle", "On") === "On"
   readonly property real barTextCap: Number(setting("maxBarTextWidth", "220")) || 0
@@ -65,7 +65,7 @@ BarWidget {
     iconComponent: root.iconOnly ? brandIcon : null
     tooltipText: root.hasTrack
       ? (root.service.trackTitle + (root.playing ? "" : " — paused"))
-      : "neowake"
+      : "neomarchy"
 
     readonly property real fittedWidth: Math.ceil(glyph.implicitWidth
       + content.spacing + label.implicitWidth + scaledHorizontalMargin * 2)
@@ -189,7 +189,7 @@ BarWidget {
   function openFullPanel() {
     popupOpen = false
     if (bar && bar.shell)
-      bar.shell.summon("org.renerocksai.neowake", "{}")
+      bar.shell.summon("org.renerocksai.neomarchy", "{}")
   }
 
   function formatTime(seconds) {
@@ -233,7 +233,7 @@ BarWidget {
 
         Button {
           width: parent.width
-          text: "Open neowake to sign in"
+          text: "Open the panel to sign in"
           foreground: root.bar ? root.bar.foreground : Color.foreground
           bordered: true
           onClicked: root.openFullPanel()
@@ -672,7 +672,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "org.renerocksai.neowake.player"
+    target: "org.renerocksai.neomarchy.player"
 
     function toggle(): string {
       root.service ? root.service.togglePlayback() : null

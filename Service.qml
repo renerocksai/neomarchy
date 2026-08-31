@@ -2,7 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Shared state for the neowake plugin: one mpv instance driven over its JSON
+// Shared state for the neomarchy plugin: one mpv instance driven over its JSON
 // IPC socket, and every piece of catalogue data fetched through bin/neowake.
 Item {
   id: root
@@ -63,7 +63,7 @@ Item {
   readonly property bool currentIsFavorite: trackId !== "" && isFavorite(trackId)
 
   readonly property string socketPath:
-    (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-neowake-mpv.sock"
+    (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-neomarchy-mpv.sock"
 
   signal trackStarted(var item)
 

@@ -1,4 +1,4 @@
-# neowake for the Omarchy bar
+# neomarchy
 
 Search, favorite and play [neowake](https://app.neowake.de/) sessions from the
 Omarchy status bar — without opening a browser.
@@ -38,11 +38,11 @@ Everything is already on a stock Omarchy box:
 ## Install
 
 ```bash
-git clone https://github.com/renerocksai/neowake ~/code/neowake
-ln -sfn ~/code/neowake ~/.config/omarchy/plugins/org.renerocksai.neowake
-omarchy plugin validate ~/.config/omarchy/plugins/org.renerocksai.neowake
+git clone https://github.com/renerocksai/neomarchy ~/code/neomarchy
+ln -sfn ~/code/neomarchy ~/.config/omarchy/plugins/org.renerocksai.neomarchy
+omarchy plugin validate ~/code/neomarchy   # the real directory, not the symlink
 omarchy-shell shell rescanPlugins
-omarchy plugin enable org.renerocksai.neowake --section right
+omarchy plugin enable org.renerocksai.neomarchy --section right
 ```
 
 `omarchy plugin add` only takes a git URL and clones a real directory; the
@@ -54,7 +54,7 @@ Either from the panel (click the bar icon → **Open** → sign in), or from a
 terminal:
 
 ```bash
-~/.config/omarchy/plugins/org.renerocksai.neowake/bin/neowake login
+~/.config/omarchy/plugins/org.renerocksai.neomarchy/bin/neowake login
 ```
 
 It asks for your neowake username (or the email you sign in with) and your
@@ -101,17 +101,17 @@ The widget exposes IPC methods, so you can bind anything in
 `~/.config/hypr/bindings.lua`:
 
 ```bash
-omarchy-shell -q org.renerocksai.neowake.player toggle        # play/pause
-omarchy-shell -q org.renerocksai.neowake.player stop
-omarchy-shell -q org.renerocksai.neowake.player next          # next favorite
-omarchy-shell -q org.renerocksai.neowake.player previous
-omarchy-shell -q org.renerocksai.neowake.player volumeUp
-omarchy-shell -q org.renerocksai.neowake.player volumeDown
-omarchy-shell -q org.renerocksai.neowake.player miniPlayer    # toggle the popup
-omarchy-shell -q org.renerocksai.neowake.player playFavorite 0
-omarchy-shell -q org.renerocksai.neowake.player playSession 280824
-omarchy-shell    org.renerocksai.neowake.player state         # JSON status
-omarchy-shell    shell toggle org.renerocksai.neowake '{}'    # the full panel
+omarchy-shell -q org.renerocksai.neomarchy.player toggle        # play/pause
+omarchy-shell -q org.renerocksai.neomarchy.player stop
+omarchy-shell -q org.renerocksai.neomarchy.player next          # next favorite
+omarchy-shell -q org.renerocksai.neomarchy.player previous
+omarchy-shell -q org.renerocksai.neomarchy.player volumeUp
+omarchy-shell -q org.renerocksai.neomarchy.player volumeDown
+omarchy-shell -q org.renerocksai.neomarchy.player miniPlayer    # toggle the popup
+omarchy-shell -q org.renerocksai.neomarchy.player playFavorite 0
+omarchy-shell -q org.renerocksai.neomarchy.player playSession 280824
+omarchy-shell    org.renerocksai.neomarchy.player state         # JSON status
+omarchy-shell    shell toggle org.renerocksai.neomarchy '{}'    # the full panel
 ```
 
 ## Settings

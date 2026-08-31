@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""neowake — neowake client for the Omarchy shell plugin.
+"""neowake — client for the neowake membership site, behind the neomarchy plugin.
 
 Stdlib only. Every command prints a single JSON object on stdout:
 

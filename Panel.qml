@@ -13,7 +13,7 @@ Item {
   property bool opened: false
   property bool closingFromHost: false
 
-  readonly property string pluginId: "org.renerocksai.neowake"
+  readonly property string pluginId: "org.renerocksai.neomarchy"
   readonly property color foreground: Color.foreground
   readonly property color background: Color.background
   readonly property color accent: Color.accent
@@ -137,7 +137,7 @@ Item {
   FloatingWindow {
     id: window
     visible: root.opened
-    title: "neowake"
+    title: "neomarchy"
     color: root.background
     implicitWidth: 940
     implicitHeight: 700
