@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "org.renerocksai.neowake",
+  "name": "neowake",
+  "version": "0.1.0",
+  "description": "Search, favorite and play neowake sessions from the bar.",
+  "kinds": ["service", "bar-widget", "panel"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "neowake",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTrackTitle": "On",
+      "maxBarTextWidth": "220",
+      "defaultSearchMode": "keyword",
+      "repeat": "Off",
+      "cacheOnPlay": "Off",
+      "volumeStep": 5,
+      "catalogRefreshDays": 7
+    },
+    "schema": [
+      {
+        "key": "showTrackTitle",
+        "type": "enum",
+        "label": "Show session title in the bar",
+        "options": ["On", "Off"]
+      },
+      {
+        "key": "maxBarTextWidth",
+        "type": "string",
+        "label": "Maximum title width (px)"
+      },
+      {
+        "key": "defaultSearchMode",
+        "type": "enum",
+        "label": "Search tab opened by default",
+        "options": ["keyword", "local", "ai", "frequency"]
+      },
+      {
+        "key": "repeat",
+        "type": "enum",
+        "label": "Repeat the running session",
+        "options": ["Off", "On"]
+      },
+      {
+        "key": "cacheOnPlay",
+        "type": "enum",
+        "label": "Keep played sessions offline",
+        "options": ["Off", "On"]
+      },
+      {
+        "key": "volumeStep",
+        "type": "integer",
+        "label": "Scroll wheel volume step (%)",
+        "min": 1,
+        "max": 25,
+        "step": 1
+      },
+      {
+        "key": "catalogRefreshDays",
+        "type": "integer",
+        "label": "Refresh the session catalog every N days",
+        "min": 1,
+        "max": 90,
+        "step": 1
+      }
+    ]
+  }
+}

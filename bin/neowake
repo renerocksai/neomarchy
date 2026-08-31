@@ -1,0 +1,1144 @@
+#!/usr/bin/env python3
+"""neowake — neowake client for the Omarchy shell plugin.
+
+Stdlib only. Every command prints a single JSON object on stdout:
+
+    {"ok": true,  ...}          success
+    {"ok": false, "error": ..., "code": ...}   failure (exit status 1)
+
+The QML plugin never parses HTML or holds a credential; it only reads this.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import getpass
+import html
+import http.cookiejar
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+SITE = "https://app.neowake.de"
+API = "https://neowake-webapp-328920627728.europe-west10.run.app/api"
+CDN_HOST = "neowake-sounds.b-cdn.net"
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
+)
+
+KEYRING_SERVICE = "neowake-plugin"
+
+# The membership gate redirects logged-out requests here.
+LOCKED_PATH = "/account-gesperrt/"
+
+CATALOG_MAX_AGE = 7 * 24 * 3600
+FAVORITES_MAX_AGE = 300
+
+
+def _xdg(var: str, default: str) -> Path:
+    return Path(os.environ.get(var) or Path.home() / default).expanduser()
+
+
+STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state") / "neowake"
+CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config") / "neowake"
+COOKIE_FILE = STATE_DIR / "cookies.txt"
+CATALOG_FILE = STATE_DIR / "catalog.json"
+DETAIL_FILE = STATE_DIR / "details.json"
+FAVORITES_FILE = STATE_DIR / "favorites.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+AUDIO_DIR = STATE_DIR / "audio"
+
+
+class NwError(Exception):
+    def __init__(self, message: str, code: str = "error"):
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# small json-file helpers
+# --------------------------------------------------------------------------
+
+
+def read_json(path: Path, default):
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path: Path, payload, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+    os.chmod(tmp, mode)
+    tmp.replace(path)
+
+
+def load_config() -> dict:
+    return read_json(CONFIG_FILE, {})
+
+
+def save_config(cfg: dict) -> None:
+    write_json(CONFIG_FILE, cfg, mode=0o600)
+
+
+def config_user(cfg: dict | None = None) -> str | None:
+    """The neowake login name. Older configs stored it under 'email'."""
+    cfg = load_config() if cfg is None else cfg
+    return cfg.get("username") or cfg.get("email")
+
+
+# --------------------------------------------------------------------------
+# keyring (libsecret) — same pattern the Spotify plugin uses
+# --------------------------------------------------------------------------
+
+
+# The site calls this a username; it may or may not look like an email.
+# "email" is the attribute earlier builds used — still read, never written.
+KEYRING_ATTR = "user"
+KEYRING_ATTR_LEGACY = "email"
+
+
+def _secret_tool(verb: str, attr: str, user: str, password: str | None = None):
+    return subprocess.run(
+        ["secret-tool", verb]
+        + (["--label=neowake membership password"] if verb == "store" else [])
+        + ["service", KEYRING_SERVICE, "kind", "password", attr, user],
+        input=password,
+        text=True,
+        capture_output=True,
+    )
+
+
+def keyring_store(user: str, password: str) -> None:
+    proc = _secret_tool("store", KEYRING_ATTR, user, password)
+    if proc.returncode != 0:
+        raise NwError(
+            "could not store password in keyring: " + proc.stderr.strip(),
+            "keyring",
+        )
+
+
+def keyring_lookup(user: str) -> str | None:
+    proc = _secret_tool("lookup", KEYRING_ATTR, user)
+    if proc.returncode == 0 and proc.stdout.strip("\n"):
+        return proc.stdout.strip("\n")
+
+    legacy = _secret_tool("lookup", KEYRING_ATTR_LEGACY, user)
+    password = legacy.stdout.strip("\n") if legacy.returncode == 0 else ""
+    if not password:
+        return None
+    # Migrate it forward so the entry stops claiming to be an email address.
+    if _secret_tool("store", KEYRING_ATTR, user, password).returncode == 0:
+        _secret_tool("clear", KEYRING_ATTR_LEGACY, user)
+    return password
+
+
+def keyring_clear(user: str) -> None:
+    _secret_tool("clear", KEYRING_ATTR, user)
+    _secret_tool("clear", KEYRING_ATTR_LEGACY, user)
+
+
+# --------------------------------------------------------------------------
+# HTTP session
+# --------------------------------------------------------------------------
+
+
+class Response:
+    def __init__(self, url: str, status: int, body: bytes):
+        self.url = url
+        self.status = status
+        self.body = body
+        self._text: str | None = None
+
+    @property
+    def text(self) -> str:
+        if self._text is None:
+            self._text = self.body.decode("utf-8", "replace")
+        return self._text
+
+    @property
+    def locked(self) -> bool:
+        """Membership gate bounced us — the session is gone or expired."""
+        return LOCKED_PATH in self.url or "wp-login.php" in self.url
+
+
+class Session:
+    def __init__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
+        if COOKIE_FILE.exists():
+            try:
+                self.jar.load(ignore_discard=True, ignore_expires=True)
+            except (OSError, http.cookiejar.LoadError):
+                pass
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+        self.opener.addheaders = []
+
+    def save(self) -> None:
+        self.jar.save(ignore_discard=True, ignore_expires=True)
+        os.chmod(COOKIE_FILE, 0o600)
+
+    @property
+    def logged_in(self) -> bool:
+        return any(c.name.startswith("wordpress_logged_in_") for c in self.jar)
+
+    def request(
+        self,
+        url: str,
+        data: dict | bytes | None = None,
+        headers: dict | None = None,
+        timeout: int = 30,
+    ) -> Response:
+        if isinstance(data, dict):
+            data = urllib.parse.urlencode(data, encoding="utf-8").encode()
+        req = urllib.request.Request(url, data=data)
+        req.add_header("User-Agent", UA)
+        req.add_header("Accept-Language", "de-DE,de;q=0.9,en;q=0.8")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                return Response(resp.geturl(), resp.status, resp.read())
+        except urllib.error.HTTPError as exc:
+            return Response(exc.geturl(), exc.code, exc.read())
+        except urllib.error.URLError as exc:
+            raise NwError(f"network error: {exc.reason}", "network") from exc
+
+    # -- authentication ---------------------------------------------------
+
+    def login(self, user: str, password: str, otp: str | None = None) -> dict:
+        # wp-login.php sets the test cookie WordPress insists on seeing back.
+        self.request(f"{SITE}/wp-login.php")
+
+        form = {
+            "log": user,
+            "pwd": password,
+            "rememberme": "forever",
+            "redirect_to": f"{SITE}/dashboard/",
+            "testcookie": "1",
+            "wp-submit": "Anmelden",
+        }
+        if otp:
+            form["wfls-token"] = otp
+        resp = self.request(f"{SITE}/wp-login.php", data=form)
+
+        if self.logged_in:
+            self.save()
+            return {"state": "ok"}
+
+        body = resp.text
+        if "wfls-token" in body or "wordfence" in body.lower():
+            return {"state": "otp-required"}
+
+        match = re.search(
+            r'id="login_error"[^>]*>(.*?)</div>', body, re.S | re.I
+        )
+        reason = "unknown login failure"
+        if match:
+            reason = re.sub(r"<[^>]+>", " ", match.group(1))
+            reason = html.unescape(reason)
+            reason = re.sub(r"\s+", " ", reason).strip()
+        return {"state": "failed", "reason": reason}
+
+    def ensure(self) -> None:
+        """Guarantee a usable session, silently re-logging in when possible."""
+        if self.logged_in:
+            return
+        user = config_user()
+        if not user:
+            raise NwError("not logged in — run: neowake login", "auth")
+        password = keyring_lookup(user)
+        if not password:
+            raise NwError(
+                "session expired and no password in keyring — run: neowake login",
+                "auth",
+            )
+        result = self.login(user, password)
+        if result["state"] != "ok":
+            raise NwError(
+                "automatic re-login failed: " + result.get("reason", result["state"]),
+                "auth",
+            )
+
+    def get_page(self, path: str, retry: bool = True) -> Response:
+        """Authenticated GET of a member page, re-logging in once if bounced."""
+        self.ensure()
+        url = path if path.startswith("http") else SITE + path
+        resp = self.request(url)
+        if resp.locked and retry:
+            user = config_user()
+            password = keyring_lookup(user) if user else None
+            if password and self.login(user, password)["state"] == "ok":
+                resp = self.request(url)
+        if resp.locked:
+            raise NwError("session rejected by the membership gate", "auth")
+        return resp
+
+
+# --------------------------------------------------------------------------
+# WordPress odds and ends
+# --------------------------------------------------------------------------
+
+
+def find_localized(body: str, name: str) -> dict | None:
+    """Pull a wp_localize_script blob (var NAME = {...};) out of a page."""
+    match = re.search(
+        re.escape(name) + r"\s*=\s*(\{.*?\})\s*;", body, re.S
+    )
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except ValueError:
+        return None
+
+
+def slug_to_title(slug: str) -> str:
+    words = slug.replace("_", "-").split("-")
+    return " ".join(w.capitalize() for w in words if w)
+
+
+# --------------------------------------------------------------------------
+# catalog
+# --------------------------------------------------------------------------
+
+
+class CatalogParser(HTMLParser):
+    """Scrapes the Essential Grid on /playlists/.
+
+    Each session is one <li data-id="<post id>" class="... filter-<cat> ...">
+    wrapping a link to /playlist/<slug>/ and a lazy-loaded cover image.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.items: list[dict] = []
+        self._depth = 0
+        self._current: dict | None = None
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if self._current is None:
+            if tag == "li" and (attrs.get("data-id") or "").isdigit():
+                self._current = {
+                    "id": attrs["data-id"],
+                    "slug": None,
+                    "thumb": None,
+                    "categories": self._categories(attrs.get("class", "")),
+                }
+                self._depth = 1
+                self._text = []
+            return
+
+        if tag == "li":
+            self._depth += 1
+
+        if tag == "a" and not self._current["slug"]:
+            href = attrs.get("href", "")
+            match = re.search(r"/playlist/([^/?#]+)/?", href)
+            if match:
+                self._current["slug"] = match.group(1)
+
+        if tag == "img" and not self._current["thumb"]:
+            src = attrs.get("data-lazysrc") or attrs.get("src") or ""
+            if src and "25x25" not in src:
+                self._current["thumb"] = src
+
+    def handle_endtag(self, tag):
+        if self._current is None or tag != "li":
+            return
+        self._depth -= 1
+        if self._depth > 0:
+            return
+        item = self._current
+        self._current = None
+        if not item["slug"]:
+            return
+        blurb = re.sub(r"\s+", " ", " ".join(self._text)).strip()
+        duration = re.search(r"([<>]?\s*\d+\s*Minuten)", blurb)
+        item["durationHint"] = duration.group(1).strip() if duration else None
+        item["title"] = slug_to_title(item["slug"])
+        item["titleSource"] = "slug"
+        self.items.append(item)
+
+    def handle_data(self, data):
+        if self._current is not None:
+            self._text.append(data)
+
+    @staticmethod
+    def _categories(class_attr: str) -> list[str]:
+        cats = []
+        for cls in class_attr.split():
+            if cls.startswith("filter-"):
+                cat = cls[len("filter-"):]
+                if cat and cat not in cats:
+                    cats.append(cat)
+        return cats
+
+
+# /playlists/ holds most of the catalog but not all of it — collections and
+# some categories live on their own pages, so the nav is crawled as well.
+INDEX_SEED = "/playlists/"
+MAX_INDEX_PAGES = 40
+INDEX_BLOCKLIST = {
+    "/", "/dashboard/", "/favoriten/", "/activity/", "/messages/", "/profile/",
+    "/faq/", "/anleitungen/", "/app/", "/neurotuner/", "/account-gesperrt/",
+    "/abonnement-einstellungen/", "/playlist/", "/playlists/",
+}
+INDEX_BLOCK_PREFIXES = ("/bonus", "/inhalt-bonus", "/wp-", "/kategorie-podcast")
+INDEX_LINK_RE = re.compile(r'href="https://app\.neowake\.de(/[a-z0-9\-]+/)"')
+
+
+def discover_index_pages(session: Session) -> list[str]:
+    """Listing pages linked from the dashboard nav, seeded with /playlists/."""
+    try:
+        body = session.get_page("/dashboard/").text
+    except NwError:
+        return [INDEX_SEED]
+
+    pages = []
+    for path in INDEX_LINK_RE.findall(body):
+        if path in INDEX_BLOCKLIST or path.startswith(INDEX_BLOCK_PREFIXES):
+            continue
+        if path not in pages:
+            pages.append(path)
+    return [INDEX_SEED] + pages[:MAX_INDEX_PAGES]
+
+
+def build_catalog(session: Session) -> dict:
+    merged: dict[str, dict] = {}
+    scanned = 0
+
+    for path in discover_index_pages(session):
+        try:
+            body = session.get_page(path).text
+        except NwError:
+            continue
+        parser = CatalogParser()
+        parser.feed(body)
+        if not parser.items:
+            continue
+        scanned += 1
+        for item in parser.items:
+            existing = merged.get(item["id"])
+            if existing is None:
+                merged[item["id"]] = item
+            else:
+                # Later pages only contribute categories the first one missed.
+                for cat in item["categories"]:
+                    if cat not in existing["categories"]:
+                        existing["categories"].append(cat)
+
+    if not merged:
+        raise NwError("no sessions found on any listing page", "parse")
+
+    details = read_json(DETAIL_FILE, {})
+    for item in merged.values():
+        known = details.get(item["id"])
+        if known and known.get("title"):
+            item["title"] = known["title"]
+            item["titleSource"] = "page"
+
+    catalog = {
+        "fetchedAt": int(time.time()),
+        "count": len(merged),
+        "pagesScanned": scanned,
+        "sessions": sorted(merged.values(), key=lambda i: i["title"].lower()),
+    }
+    write_json(CATALOG_FILE, catalog)
+    return catalog
+
+
+def load_catalog(session: Session, refresh: bool = False) -> dict:
+    catalog = read_json(CATALOG_FILE, None)
+    stale = (
+        catalog is None
+        or refresh
+        or time.time() - catalog.get("fetchedAt", 0) > CATALOG_MAX_AGE
+    )
+    if stale:
+        try:
+            return build_catalog(session)
+        except NwError:
+            if catalog is None:
+                raise
+    return catalog
+
+
+def catalog_index(catalog: dict) -> dict:
+    index = {}
+    for item in catalog["sessions"]:
+        index[item["id"]] = item
+        index[item["slug"]] = item
+    return index
+
+
+# --------------------------------------------------------------------------
+# session details (audio url + real title)
+# --------------------------------------------------------------------------
+
+
+AUDIOPATH_RE = re.compile(r'data-audiopath="([^"]+)"')
+TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
+OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', re.I
+)
+
+
+def clean_title(raw: str) -> str:
+    title = html.unescape(raw).strip()
+    for suffix in (" – neowake®", " - neowake®", " – neowake", " | neowake"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)]
+    return title.strip()
+
+
+def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
+    """key is a post id or a slug. Returns audio url + metadata, cached."""
+    details = read_json(DETAIL_FILE, {})
+    catalog = read_json(CATALOG_FILE, None)
+    index = catalog_index(catalog) if catalog else {}
+
+    item = index.get(key)
+    post_id = item["id"] if item else (key if key.isdigit() else None)
+
+    if not force and post_id and post_id in details:
+        cached = details[post_id]
+        if cached.get("audio"):
+            return cached
+
+    if item:
+        url = f"{SITE}/playlist/{item['slug']}/"
+    elif post_id:
+        url = f"{SITE}/?p={post_id}"
+    else:
+        url = f"{SITE}/playlist/{key}/"
+
+    resp = session.get_page(url)
+    body = resp.text
+
+    audio = None
+    for candidate in AUDIOPATH_RE.findall(body):
+        candidate = html.unescape(candidate)
+        if CDN_HOST in candidate or candidate.lower().endswith(
+            (".mp3", ".m4a", ".wav", ".ogg")
+        ):
+            audio = candidate
+            break
+    if not audio:
+        raise NwError(f"no audio track found on {resp.url}", "no-audio")
+
+    title_match = TITLE_RE.search(body)
+    image_match = OG_IMAGE_RE.search(body)
+    slug_match = re.search(r"/playlist/([^/?#]+)/", resp.url)
+
+    if not post_id:
+        id_match = re.search(r'data-elementor-id="(\d+)"', body)
+        post_id = id_match.group(1) if id_match else key
+
+    detail = {
+        "id": post_id,
+        "slug": slug_match.group(1) if slug_match else key,
+        "title": clean_title(title_match.group(1)) if title_match else slug_to_title(key),
+        "audio": audio,
+        "thumb": html.unescape(image_match.group(1)) if image_match else (
+            item.get("thumb") if item else None
+        ),
+        "url": resp.url,
+        "categories": item.get("categories", []) if item else [],
+        "resolvedAt": int(time.time()),
+    }
+    details[post_id] = detail
+    write_json(DETAIL_FILE, details)
+    return detail
+
+
+def playable(detail: dict) -> dict:
+    """Prefer an offline copy when we have one."""
+    local = cached_path(detail["id"])
+    out = dict(detail)
+    out["cached"] = local is not None
+    out["playUrl"] = local.as_uri() if local else detail["audio"]
+    return out
+
+
+# --------------------------------------------------------------------------
+# offline cache
+# --------------------------------------------------------------------------
+
+
+def cached_path(post_id: str) -> Path | None:
+    if not AUDIO_DIR.exists():
+        return None
+    for path in AUDIO_DIR.glob(f"{post_id}.*"):
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def download_audio(session: Session, detail: dict) -> Path:
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    existing = cached_path(detail["id"])
+    if existing:
+        return existing
+
+    suffix = Path(urllib.parse.urlparse(detail["audio"]).path).suffix or ".mp3"
+    target = AUDIO_DIR / f"{detail['id']}{suffix}"
+
+    req = urllib.request.Request(detail["audio"], headers={"User-Agent": UA})
+    tmp = None
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            with tempfile.NamedTemporaryFile(
+                dir=AUDIO_DIR, delete=False
+            ) as handle:
+                tmp = Path(handle.name)
+                shutil.copyfileobj(resp, handle, length=1 << 20)
+    except urllib.error.URLError as exc:
+        if tmp and tmp.exists():
+            tmp.unlink()
+        raise NwError(f"download failed: {exc.reason}", "network") from exc
+    tmp.replace(target)
+    return target
+
+
+# --------------------------------------------------------------------------
+# favorites
+# --------------------------------------------------------------------------
+
+
+def favorites_endpoints(session: Session) -> tuple[dict, dict]:
+    resp = session.get_page("/favoriten/")
+    get_cfg = find_localized(resp.text, "CCC_MY_FAVORITE_GET")
+    update_cfg = find_localized(resp.text, "CCC_MY_FAVORITE_UPDATE")
+    if not get_cfg or not update_cfg:
+        raise NwError("could not find the favorites endpoints", "parse")
+    return get_cfg, update_cfg
+
+
+def favorite_ids(session: Session) -> list[str]:
+    get_cfg, _ = favorites_endpoints(session)
+    resp = session.request(
+        get_cfg["api"],
+        data={"action": get_cfg["action"], "nonce": get_cfg["nonce"]},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    raw = resp.text.strip().strip('"')
+    return [part for part in raw.split(",") if part.strip().isdigit()]
+
+
+def set_favorite_ids(session: Session, ids: list[str]) -> None:
+    _, update_cfg = favorites_endpoints(session)
+    session.request(
+        update_cfg["api"],
+        data={
+            "action": update_cfg["action"],
+            "nonce": update_cfg["nonce"],
+            "post_ids": ",".join(ids),
+        },
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+
+
+def favorites_view(session: Session, ids: list[str]) -> list[dict]:
+    catalog = load_catalog(session)
+    index = catalog_index(catalog)
+    details = read_json(DETAIL_FILE, {})
+
+    # A few sessions (YouTube ones especially) never appear on a listing page.
+    # Resolve those directly so a favorite is never a bare post id.
+    for post_id in ids:
+        if post_id in index or details.get(post_id, {}).get("audio"):
+            continue
+        try:
+            details[post_id] = resolve_detail(session, post_id)
+        except NwError:
+            pass
+
+    out = []
+    for post_id in ids:
+        item = index.get(post_id) or {}
+        detail = details.get(post_id, {})
+        out.append(
+            {
+                "id": post_id,
+                "slug": detail.get("slug") or item.get("slug"),
+                "title": detail.get("title") or item.get("title") or post_id,
+                "thumb": detail.get("thumb") or item.get("thumb"),
+                "categories": item.get("categories", []),
+                "durationHint": item.get("durationHint"),
+                "audio": detail.get("audio"),
+                "cached": cached_path(post_id) is not None,
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
+
+
+def api_search(mode: str, query: str, user_id) -> list[dict]:
+    endpoint = {
+        "keyword": f"{API}/search/keyword",
+        "frequency": f"{API}/search/frequency",
+        "ai": f"{API}/recommendations",
+    }[mode]
+
+    # The recommendation endpoint wants a different field name than the two
+    # search endpoints, and answers in a different shape.
+    payload = {"userQuery" if mode == "ai" else "query": query}
+    if user_id:
+        payload["userId"] = user_id
+    body = json.dumps(payload).encode()
+
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": UA,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        raise NwError(f"search API {exc.code}: {detail}", "api") from exc
+    except urllib.error.URLError as exc:
+        raise NwError(f"network error: {exc.reason}", "network") from exc
+
+    if mode == "ai":
+        return flatten_recommendations(data)
+    if isinstance(data, dict):
+        for key in ("sessions", "results"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        return []
+    return data if isinstance(data, list) else []
+
+
+def flatten_recommendations(data) -> list[dict]:
+    """{recommendations:[{session_title, reason, sessionData}], additional_sessions}"""
+    if not isinstance(data, dict):
+        return []
+
+    out = []
+    for entry in data.get("recommendations") or []:
+        if not isinstance(entry, dict):
+            continue
+        session = dict(entry.get("sessionData") or {})
+        session["title"] = entry.get("session_title") or session.get("title")
+        session["reason"] = entry.get("reason")
+        session["recommended"] = True
+        out.append(session)
+
+    for session in data.get("additional_sessions") or []:
+        if isinstance(session, dict) and session.get("id"):
+            out.append(session)
+    return out
+
+
+def local_search(catalog: dict, query: str, limit: int) -> list[dict]:
+    needle = query.lower().strip()
+    scored = []
+    for item in catalog["sessions"]:
+        haystacks = [
+            item["title"].lower(),
+            item["slug"].replace("-", " "),
+            " ".join(item.get("categories", [])),
+        ]
+        best = 0.0
+        for hay in haystacks:
+            if needle in hay:
+                # Prefer prefix hits, then any substring.
+                best = max(best, 1.0 if hay.startswith(needle) else 0.9)
+            else:
+                best = max(
+                    best, difflib.SequenceMatcher(None, needle, hay).ratio()
+                )
+        if best >= 0.45:
+            scored.append((best, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [
+        {**item, "score": round(score, 4), "source": "local"}
+        for score, item in scored[:limit]
+    ]
+
+
+def decorate_results(session: Session, results: list[dict]) -> list[dict]:
+    """Attach slug/thumb/cached from the local catalog; never blocks on the net."""
+    try:
+        catalog = load_catalog(session)
+    except NwError:
+        catalog = {"sessions": []}
+    index = catalog_index(catalog)
+    details = read_json(DETAIL_FILE, {})
+
+    # The search API is the cheapest source of real titles — the listing grid
+    # only carries cover images, so keep every title the search hands us.
+    learned = False
+    for entry in results:
+        post_id = str(entry.get("id") or "")
+        title = (entry.get("title") or "").strip()
+        if not post_id or not title:
+            continue
+        detail = details.setdefault(post_id, {"id": post_id})
+        if detail.get("title") != title and detail.get("titleSource") != "page":
+            detail["title"] = title
+            detail["titleSource"] = "search"
+            learned = True
+    if learned:
+        write_json(DETAIL_FILE, details)
+
+    out = []
+    for entry in results:
+        post_id = str(entry.get("id") or "")
+        item = index.get(post_id, {})
+        detail = details.get(post_id, {})
+        out.append(
+            {
+                "id": post_id,
+                "title": entry.get("title") or detail.get("title") or item.get("title"),
+                "slug": detail.get("slug") or item.get("slug"),
+                "thumb": detail.get("thumb") or item.get("thumb"),
+                "duration": entry.get("duration"),
+                "categories": entry.get("categories") or item.get("categories", []),
+                "shortDescription": entry.get("shortDescription"),
+                "reason": entry.get("reason"),
+                "recommended": entry.get("recommended", False),
+                "frequencies": entry.get("frequencies"),
+                "keywords": entry.get("keywords", [])[:8],
+                "headphonesRequired": entry.get("headphonesRequired"),
+                "score": entry.get("score"),
+                "audio": detail.get("audio"),
+                "cached": cached_path(post_id) is not None if post_id else False,
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def cmd_login(session: Session, args) -> dict:
+    cfg = load_config()
+    user = args.user or config_user(cfg)
+    if not user:
+        if not sys.stdin.isatty():
+            raise NwError("no username given (--user)", "usage")
+        user = input("neowake username or email: ").strip()
+    if not user:
+        raise NwError("no username given", "usage")
+
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    elif sys.stdin.isatty():
+        password = getpass.getpass(f"password for {user}: ")
+    else:
+        password = keyring_lookup(user) or ""
+    if not password:
+        raise NwError("no password given", "usage")
+
+    result = session.login(user, password, otp=args.otp)
+
+    if result["state"] == "otp-required":
+        return {
+            "ok": True,
+            "state": "otp-required",
+            "message": "two-factor code required — rerun with --otp <code>",
+        }
+    if result["state"] != "ok":
+        raise NwError(result.get("reason", "login failed"), "auth")
+
+    cfg["username"] = user
+    cfg.pop("email", None)
+    save_config(cfg)
+    if not args.no_store:
+        keyring_store(user, password)
+
+    user_id = discover_user_id(session)
+    if user_id:
+        cfg["userId"] = user_id
+        save_config(cfg)
+
+    return {"ok": True, "state": "ok", "username": user, "userId": user_id}
+
+
+def discover_user_id(session: Session):
+    try:
+        resp = session.get_page("/dashboard/")
+    except NwError:
+        return None
+    cfg = find_localized(resp.text, "neowakeSearchConfig")
+    if cfg and cfg.get("user_id"):
+        return cfg["user_id"]
+    match = re.search(r'"user_id"\s*:\s*"?(\d+)"?', resp.text)
+    return match.group(1) if match else None
+
+
+def cmd_logout(session: Session, args) -> dict:
+    cfg = load_config()
+    user = config_user(cfg)
+    if COOKIE_FILE.exists():
+        COOKIE_FILE.unlink()
+    if args.forget and user:
+        keyring_clear(user)
+        cfg.pop("username", None)
+        cfg.pop("email", None)
+        save_config(cfg)
+    return {"ok": True, "forgot": bool(args.forget)}
+
+
+def cmd_status(session: Session, args) -> dict:
+    cfg = load_config()
+    catalog = read_json(CATALOG_FILE, None)
+    user = config_user(cfg)
+    cached = list(AUDIO_DIR.glob("*")) if AUDIO_DIR.exists() else []
+    return {
+        "ok": True,
+        "loggedIn": session.logged_in,
+        "username": user,
+        "hasStoredPassword": bool(user and keyring_lookup(user)),
+        "userId": cfg.get("userId"),
+        "catalogCount": catalog.get("count") if catalog else 0,
+        "catalogAge": int(time.time() - catalog["fetchedAt"]) if catalog else None,
+        "cachedTracks": len([p for p in cached if p.is_file()]),
+    }
+
+
+def cmd_catalog(session: Session, args) -> dict:
+    catalog = load_catalog(session, refresh=args.refresh)
+    return {
+        "ok": True,
+        "count": catalog["count"],
+        "pagesScanned": catalog.get("pagesScanned"),
+        "fetchedAt": catalog["fetchedAt"],
+        "sessions": catalog["sessions"] if args.full else [],
+    }
+
+
+def cmd_favorites(session: Session, args) -> dict:
+    cache = read_json(FAVORITES_FILE, None)
+    fresh = (
+        cache is not None
+        and not args.refresh
+        and time.time() - cache.get("fetchedAt", 0) < FAVORITES_MAX_AGE
+    )
+    if fresh:
+        ids = cache["ids"]
+    else:
+        ids = favorite_ids(session)
+        write_json(FAVORITES_FILE, {"fetchedAt": int(time.time()), "ids": ids})
+    return {"ok": True, "count": len(ids), "favorites": favorites_view(session, ids)}
+
+
+def cmd_fav(session: Session, args) -> dict:
+    ids = favorite_ids(session)
+    post_id = str(args.id)
+    if args.action == "add" and post_id not in ids:
+        ids.append(post_id)
+    elif args.action == "remove" and post_id in ids:
+        ids.remove(post_id)
+    elif args.action == "toggle":
+        ids.remove(post_id) if post_id in ids else ids.append(post_id)
+    set_favorite_ids(session, ids)
+    write_json(FAVORITES_FILE, {"fetchedAt": int(time.time()), "ids": ids})
+    return {"ok": True, "favorite": post_id in ids, "count": len(ids)}
+
+
+def cmd_search(session: Session, args) -> dict:
+    query = " ".join(args.query).strip()
+    if not query:
+        raise NwError("empty query", "usage")
+
+    if args.mode == "local":
+        catalog = load_catalog(session)
+        return {
+            "ok": True,
+            "mode": "local",
+            "query": query,
+            "results": local_search(catalog, query, args.limit),
+        }
+
+    cfg = load_config()
+    raw = api_search(args.mode, query, cfg.get("userId"))
+    return {
+        "ok": True,
+        "mode": args.mode,
+        "query": query,
+        "results": decorate_results(session, raw[: args.limit]),
+    }
+
+
+def cmd_resolve(session: Session, args) -> dict:
+    detail = resolve_detail(session, str(args.id), force=args.force)
+    if args.download:
+        download_audio(session, detail)
+    return {"ok": True, **playable(detail)}
+
+
+def cmd_cache(session: Session, args) -> dict:
+    if args.action == "list":
+        entries = []
+        if AUDIO_DIR.exists():
+            details = read_json(DETAIL_FILE, {})
+            for path in sorted(AUDIO_DIR.glob("*")):
+                if not path.is_file():
+                    continue
+                post_id = path.stem
+                entries.append(
+                    {
+                        "id": post_id,
+                        "title": details.get(post_id, {}).get("title", post_id),
+                        "bytes": path.stat().st_size,
+                        "path": str(path),
+                    }
+                )
+        return {"ok": True, "count": len(entries), "tracks": entries}
+
+    post_id = str(args.id)
+    if args.action == "add":
+        detail = resolve_detail(session, post_id)
+        path = download_audio(session, detail)
+        return {"ok": True, "id": detail["id"], "path": str(path)}
+
+    path = cached_path(post_id)
+    if path:
+        path.unlink()
+    return {"ok": True, "id": post_id, "removed": bool(path)}
+
+
+def cmd_enrich(session: Session, args) -> dict:
+    """Fill in real titles + audio urls for sessions we have not opened yet."""
+    catalog = load_catalog(session)
+    details = read_json(DETAIL_FILE, {})
+    pending = [s for s in catalog["sessions"] if s["id"] not in details]
+    done, failed = 0, 0
+    for item in pending[: args.limit]:
+        try:
+            resolve_detail(session, item["id"])
+            done += 1
+        except NwError:
+            failed += 1
+        time.sleep(args.delay)
+    if done:
+        build_catalog(session)
+    return {
+        "ok": True,
+        "enriched": done,
+        "failed": failed,
+        "remaining": max(0, len(pending) - args.limit),
+    }
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="neowake", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("login", help="authenticate against app.neowake.de")
+    p.add_argument("--user", "--email", dest="user",
+                   help="neowake username (or the email you sign in with)")
+    p.add_argument("--password-stdin", action="store_true",
+                   help="read the password from the first line of stdin")
+    p.add_argument("--otp", help="two-factor code, when the site asks for one")
+    p.add_argument("--no-store", action="store_true",
+                   help="do not put the password in the keyring")
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("logout")
+    p.add_argument("--forget", action="store_true",
+                   help="also drop the stored password")
+    p.set_defaults(func=cmd_logout)
+
+    p = sub.add_parser("status")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("catalog", help="the full session index")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--full", action="store_true", help="include every session")
+    p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser("favorites")
+    p.add_argument("--refresh", action="store_true")
+    p.set_defaults(func=cmd_favorites)
+
+    p = sub.add_parser("fav", help="add/remove/toggle a favorite")
+    p.add_argument("action", choices=["add", "remove", "toggle"])
+    p.add_argument("id")
+    p.set_defaults(func=cmd_fav)
+
+    p = sub.add_parser("search")
+    p.add_argument("query", nargs="+")
+    p.add_argument("--mode", default="keyword",
+                   choices=["keyword", "local", "ai", "frequency"])
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("resolve", help="post id or slug -> playable url")
+    p.add_argument("id")
+    p.add_argument("--download", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("cache")
+    p.add_argument("action", choices=["add", "remove", "list"])
+    p.add_argument("id", nargs="?")
+    p.set_defaults(func=cmd_cache)
+
+    p = sub.add_parser("enrich", help="backfill titles and audio urls")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--delay", type=float, default=0.4)
+    p.set_defaults(func=cmd_enrich)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    session = Session()
+    try:
+        result = args.func(session, args)
+    except NwError as exc:
+        json.dump({"ok": False, "error": str(exc), "code": exc.code}, sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
