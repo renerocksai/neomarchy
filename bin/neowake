@@ -498,13 +498,6 @@ def catalog_index(catalog: dict) -> dict:
 # --------------------------------------------------------------------------
 
 
-AUDIOPATH_RE = re.compile(r'data-audiopath="([^"]+)"')
-TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
-OG_IMAGE_RE = re.compile(
-    r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', re.I
-)
-
-
 def clean_title(raw: str) -> str:
     title = html.unescape(raw).strip()
     for suffix in (" – neowake®", " - neowake®", " – neowake", " | neowake"):
@@ -514,58 +507,58 @@ def clean_title(raw: str) -> str:
 
 
 def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
-    """key is a post id or a slug. Returns audio url + metadata, cached."""
+    """key is a post id or a slug. Returns audio url + metadata, cached.
+
+    The Sonaar player feeds itself from a small JSON document that carries the
+    CDN url, the real title and the cover — 600 bytes instead of the 370 KB
+    session page, so this is what we ask for.
+    """
     details = read_json(DETAIL_FILE, {})
     catalog = read_json(CATALOG_FILE, None)
     index = catalog_index(catalog) if catalog else {}
 
     item = index.get(key)
-    post_id = item["id"] if item else (key if key.isdigit() else None)
+    post_id = item["id"] if item else (key if str(key).isdigit() else None)
 
-    if not force and post_id and post_id in details:
-        cached = details[post_id]
-        if cached.get("audio"):
-            return cached
+    if not force and post_id and details.get(post_id, {}).get("audio"):
+        return details[post_id]
 
-    if item:
-        url = f"{SITE}/playlist/{item['slug']}/"
-    elif post_id:
-        url = f"{SITE}/?p={post_id}"
-    else:
-        url = f"{SITE}/playlist/{key}/"
+    if post_id is None:
+        # A slug we have never seen: the session page tells us its post id.
+        page = session.get_page(f"/playlist/{key}/")
+        id_match = re.search(r'data-elementor-id="(\d+)"', page.text)
+        if not id_match:
+            raise NwError(f"could not identify the session '{key}'", "not-found")
+        post_id = id_match.group(1)
+        item = index.get(post_id) or item
 
-    resp = session.get_page(url)
-    body = resp.text
+    resp = session.get_page(f"/?load=playlist.json&albums={post_id}")
+    try:
+        data = json.loads(resp.text)
+    except ValueError:
+        raise NwError(f"session {post_id} returned no playlist", "parse") from None
 
-    audio = None
-    for candidate in AUDIOPATH_RE.findall(body):
-        candidate = html.unescape(candidate)
-        if CDN_HOST in candidate or candidate.lower().endswith(
-            (".mp3", ".m4a", ".wav", ".ogg")
-        ):
-            audio = candidate
-            break
-    if not audio:
-        raise NwError(f"no audio track found on {resp.url}", "no-audio")
+    tracks = [t for t in (data.get("tracks") or []) if t.get("mp3")]
+    if not tracks:
+        raise NwError(f"session {post_id} has no audio track", "no-audio")
 
-    title_match = TITLE_RE.search(body)
-    image_match = OG_IMAGE_RE.search(body)
-    slug_match = re.search(r"/playlist/([^/?#]+)/", resp.url)
-
-    if not post_id:
-        id_match = re.search(r'data-elementor-id="(\d+)"', body)
-        post_id = id_match.group(1) if id_match else key
+    first = tracks[0]
+    title = (first.get("album_title") or first.get("track_title") or "").strip()
+    poster = (first.get("poster") or "").strip()
 
     detail = {
         "id": post_id,
-        "slug": slug_match.group(1) if slug_match else key,
-        "title": clean_title(title_match.group(1)) if title_match else slug_to_title(key),
-        "audio": audio,
-        "thumb": html.unescape(image_match.group(1)) if image_match else (
-            item.get("thumb") if item else None
+        "slug": item.get("slug") if item else None,
+        "title": clean_title(title) if title else (
+            item.get("title") if item else slug_to_title(str(key))
         ),
-        "url": resp.url,
+        "artist": (first.get("album_artist") or "").strip() or None,
+        "audio": html.unescape(first["mp3"]),
+        "thumb": html.unescape(poster) or (item.get("thumb") if item else None),
+        "url": f"{SITE}/playlist/{item['slug']}/" if item and item.get("slug")
+               else f"{SITE}/?p={post_id}",
         "categories": item.get("categories", []) if item else [],
+        "trackCount": len(tracks),
         "resolvedAt": int(time.time()),
     }
     details[post_id] = detail
