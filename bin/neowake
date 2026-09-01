@@ -19,7 +19,7 @@ import http.cookiejar
 import json
 import os
 import re
-import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,7 +32,68 @@ from pathlib import Path
 
 SITE = "https://app.neowake.de"
 API = "https://neowake-webapp-328920627728.europe-west10.run.app/api"
-CDN_HOST = "neowake-sounds.b-cdn.net"
+
+# Every host this client is allowed to talk to. A URL is checked against one of
+# these sets before the request goes out and again after every redirect; nothing
+# else is fetched, whatever the server asks for.
+#
+# The audio hosts are pinned deliberately. A session's audio URL arrives inside
+# a JSON document served by the membership site, so it is remote input, and
+# without this it could point mpv or the downloader at any origin at all. Two
+# hosts are in use today. If neowake ever moves its audio somewhere else this
+# list is the one thing that needs changing — shipping a plugin update is cheap
+# and is the right way to widen the allowlist, rather than trusting whatever
+# host the server happens to name.
+SITE_HOST = "app.neowake.de"
+API_HOST = "neowake-webapp-328920627728.europe-west10.run.app"
+PAGE_HOSTS = frozenset({SITE_HOST})
+API_HOSTS = frozenset({API_HOST})
+IMAGE_HOSTS = frozenset({SITE_HOST})
+AUDIO_HOSTS = frozenset({
+    "neowake-sounds.b-cdn.net",
+    "downloads.brain-plus.de",
+})
+
+# Ceilings on anything that arrives over the network or off disk. None of these
+# is a tuning knob: they exist so that a hostile or broken server cannot make
+# this process consume memory or disk without bound.
+#
+# Omarchy runs on plenty of old, small-RAM laptops, so the sizes below are
+# chosen against measured worst cases rather than picked round. Only the three
+# response limits are ever held in memory, and read_capped keeps peak usage at
+# roughly one body (see the note there); the interpreter itself costs ~16 MB
+# before any of this, and a real command peaks around 32-36 MB RSS.
+#
+# Measured page sizes: the /playlists/ index is 1.85 MB and is by far the
+# largest thing fetched — a session page is 0.35 MB, the favourites page
+# 0.31 MB, and playlist.json under 1 KB. 8 MB leaves ~4x headroom for the
+# catalogue growing, while still refusing a body that could exhaust a small
+# machine.
+MAX_PAGE_BYTES = 8 << 20
+MAX_JSON_BYTES = 4 << 20        # search API answers; ~50 KB in practice
+MAX_ERROR_BYTES = 64 << 10      # only ever quoted back in a message
+MAX_CACHE_BYTES = 32 << 20      # our own JSON caches, re-read every run
+
+# Audio is the one large thing here, and this is a DISK ceiling, not a buffer:
+# download_audio streams the response to a temporary file 1 MiB at a time and
+# never holds the file in memory, so peak RSS for a download is that one chunk
+# regardless of how big the session is. A measured 90-minute session is 216 MB,
+# so 512 MB covers roughly a 3.5-hour session. It is deliberately generous
+# because the cost of being wrong is only a refused download, and it is only
+# ever reached when the user explicitly asks to keep a session offline.
+MAX_AUDIO_BYTES = 512 << 20
+MAX_CATALOG_ITEMS = 5000        # the real catalog is ~500
+MAX_FAVORITES = 2000
+MAX_TRACKS = 200
+MAX_SEARCH_RESULTS = 200
+MAX_STRING = 2000               # any single string we keep from a response
+
+# Post ids are numeric and slugs are lowercase kebab-case; both are used to
+# build URLs and filenames, so they are validated at every entry point.
+MAX_ID_LEN = 32
+MAX_SLUG_LEN = 128
+ID_RE = re.compile(r"\A[0-9]{1,%d}\Z" % MAX_ID_LEN)
+SLUG_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,%d}\Z" % (MAX_SLUG_LEN - 1))
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -69,12 +130,204 @@ class NwError(Exception):
 
 
 # --------------------------------------------------------------------------
+# input validation and resource limits
+# --------------------------------------------------------------------------
+
+
+def clip(value, limit: int = MAX_STRING) -> str:
+    """Coerce a value from a response into a string of bounded length."""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    return text[:limit]
+
+
+def bounded(items, limit: int) -> list:
+    """Take at most `limit` entries from something a response handed us."""
+    if not isinstance(items, (list, tuple)):
+        return []
+    return list(items[:limit])
+
+
+def valid_id(value) -> str:
+    """A post id: digits only. Raises rather than passing anything else on."""
+    text = "" if value is None else str(value).strip()
+    if not ID_RE.match(text):
+        raise NwError(f"invalid session id {text[:64]!r}", "invalid-id")
+    return text
+
+
+def valid_key(value) -> str:
+    """A post id or a slug — the two things `resolve` accepts.
+
+    This is the boundary for the public playSession IPC method, so it has to
+    reject anything that could reach into a URL path or a filename: no slashes,
+    no dots, no wildcards, no leading dash.
+    """
+    text = "" if value is None else str(value).strip()
+    if ID_RE.match(text) or SLUG_RE.match(text):
+        return text
+    raise NwError(f"invalid session id {text[:64]!r}", "invalid-id")
+
+
+def check_url(url: str, allowed: frozenset[str], what: str) -> str:
+    """Refuse any URL that is not plain HTTPS to an allowlisted host.
+
+    Applied before a request and again to every redirect target, so a server
+    cannot walk us onto another origin, onto a private address, or off HTTPS.
+    """
+    text = "" if url is None else str(url)
+    if len(text) > 2048:
+        raise NwError(f"{what} url is implausibly long", "url")
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError as exc:
+        raise NwError(f"{what} url is unparseable: {exc}", "url") from exc
+    if parts.scheme != "https":
+        raise NwError(
+            f"{what} url must be https, got {parts.scheme or 'no scheme'!r}", "url"
+        )
+    if parts.username or parts.password:
+        raise NwError(f"{what} url must not carry credentials", "url")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise NwError(f"{what} url has an invalid port", "url") from exc
+    if port not in (None, 443):
+        raise NwError(f"{what} url must use the default https port", "url")
+    # Compared case-folded and without a trailing dot. Not IDNA-normalised: a
+    # Unicode homograph such as U+212A KELVIN SIGN folds to "k" and so passes
+    # this check. It does not become a connection to another host — urllib's
+    # idna codec, Qt's ACE conversion and ffmpeg all fail to resolve the raw
+    # UTF-8 name — so this is a known sharp edge rather than a way through.
+    host = (parts.hostname or "").lower().rstrip(".")
+    if host not in allowed:
+        raise NwError(f"{what} url points at unexpected host {host!r}", "url")
+    return text
+
+
+class AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check the allowlist on every hop instead of only the first URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        allowed = getattr(req, "nw_allowed_hosts", None)
+        if allowed is not None:
+            # Raises NwError, which propagates out of opener.open() untouched.
+            check_url(newurl, allowed, getattr(req, "nw_what", "redirect"))
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and allowed is not None:
+            new.nw_allowed_hosts = allowed
+            new.nw_what = getattr(req, "nw_what", "redirect")
+        return new
+
+
+def read_capped(fh, limit: int, what: str) -> bytearray:
+    """Read a response body, refusing to buffer more than `limit` bytes.
+
+    Accumulates into a bytearray rather than a list of chunks joined at the
+    end. The list-and-join version costs exactly 2x the body at the moment of
+    the join (measured: an 8 MB body peaked at 16.0 MB), which on a small
+    machine is the difference that matters. A bytearray grows amortised in
+    place, so peak stays at roughly one body, and returning it uncopied avoids
+    paying that doubling again — callers only ever .decode() it or hand it to
+    json.loads(), both of which take any bytes-like object.
+
+    Reads one byte past the limit deliberately, so a body that is exactly at
+    the limit is accepted and the first byte beyond it is what trips the error.
+    """
+    buf = bytearray()
+    while True:
+        chunk = fh.read(min(1 << 16, limit - len(buf) + 1))
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise NwError(
+                f"{what} response exceeds {limit} bytes", "too-large"
+            )
+    return buf
+
+
+def declared_too_large(resp, limit: int) -> bool:
+    """True when Content-Length already promises more than we will accept."""
+    raw = resp.headers.get("Content-Length") if resp.headers else None
+    try:
+        return raw is not None and int(raw) > limit
+    except (TypeError, ValueError):
+        return False
+
+
+# --------------------------------------------------------------------------
 # small json-file helpers
 # --------------------------------------------------------------------------
 
 
-def read_json(path: Path, default):
+MAX_DETAIL_ENTRIES = 20000     # the real catalogue is ~500
+
+# A hard ceiling on what this process will ever print. The QML side buffers our
+# whole stdout in a StdioCollector before it can inspect it, and Quickshell's
+# collector has no limit of its own, so a bound here is the only thing that
+# actually protects the shell: clipping individual fields is not enough when the
+# number of fields is itself driven by a response. Measured real outputs are
+# tiny — 149 KB for the full catalogue, 16 KB for a 20-result search — so 2 MiB
+# is far more than anything legitimate, and stays well inside the 4 MB the QML
+# layer will accept.
+MAX_OUTPUT_BYTES = 2 << 20
+
+
+def safe_thumb(url):
+    """Cover art, or None. Artwork is optional, so a bad URL is dropped."""
+    if not url:
+        return None
     try:
+        return check_url(url, IMAGE_HOSTS, "artwork")
+    except NwError:
+        return None
+
+
+def read_details() -> dict:
+    """Load details.json, re-validating every URL on the way in.
+
+    Entries on disk are not trustworthy just because we wrote them: they were
+    produced by whatever version of this script ran last, from data the server
+    supplied, and older versions did no URL checking at all. Validating only at
+    fetch time would leave every already-cached entry a way to hand mpv or Qt an
+    arbitrary URL, so the check is repeated here, on the read path that every
+    consumer goes through.
+
+    An entry whose audio URL no longer passes loses it and is re-resolved on
+    demand; a bad thumb is simply dropped.
+    """
+    raw = read_json(DETAIL_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, detail in list(raw.items())[:MAX_DETAIL_ENTRIES]:
+        if not isinstance(detail, dict):
+            continue
+        try:
+            valid_id(key)
+        except NwError:
+            continue
+        clean = dict(detail)
+        audio = clean.get("audio")
+        if audio:
+            try:
+                clean["audio"] = check_url(audio, AUDIO_HOSTS, "audio")
+            except NwError:
+                clean.pop("audio", None)
+        clean["thumb"] = safe_thumb(clean.get("thumb"))
+        if clean.get("title"):
+            clean["title"] = clip(clean["title"])
+        out[key] = clean
+    return out
+
+
+def read_json(path: Path, default):
+    """Load one of our own caches, treating an oversized file as absent."""
+    try:
+        if path.stat().st_size > MAX_CACHE_BYTES:
+            return default
         with path.open(encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
@@ -161,7 +414,7 @@ def keyring_clear(user: str) -> None:
 
 
 class Response:
-    def __init__(self, url: str, status: int, body: bytes):
+    def __init__(self, url: str, status: int, body: bytes | bytearray):
         self.url = url
         self.status = status
         self.body = body
@@ -189,7 +442,8 @@ class Session:
             except (OSError, http.cookiejar.LoadError):
                 pass
         self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar)
+            urllib.request.HTTPCookieProcessor(self.jar),
+            AllowlistRedirectHandler,
         )
         self.opener.addheaders = []
 
@@ -207,19 +461,31 @@ class Session:
         data: dict | bytes | None = None,
         headers: dict | None = None,
         timeout: int = 30,
+        allowed: frozenset[str] = PAGE_HOSTS,
+        limit: int = MAX_PAGE_BYTES,
+        what: str = "page",
     ) -> Response:
+        url = check_url(url, allowed, what)
         if isinstance(data, dict):
             data = urllib.parse.urlencode(data, encoding="utf-8").encode()
         req = urllib.request.Request(url, data=data)
+        # Read back by AllowlistRedirectHandler on every hop.
+        req.nw_allowed_hosts = allowed
+        req.nw_what = what
         req.add_header("User-Agent", UA)
         req.add_header("Accept-Language", "de-DE,de;q=0.9,en;q=0.8")
         for key, value in (headers or {}).items():
             req.add_header(key, value)
         try:
             with self.opener.open(req, timeout=timeout) as resp:
-                return Response(resp.geturl(), resp.status, resp.read())
+                if declared_too_large(resp, limit):
+                    raise NwError(f"{what} response is too large", "too-large")
+                return Response(resp.geturl(), resp.status,
+                                read_capped(resp, limit, what))
         except urllib.error.HTTPError as exc:
-            return Response(exc.geturl(), exc.code, exc.read())
+            # Error bodies are only ever quoted back in a message.
+            return Response(exc.geturl(), exc.code,
+                            read_capped(exc, MAX_ERROR_BYTES, what))
         except urllib.error.URLError as exc:
             raise NwError(f"network error: {exc.reason}", "network") from exc
 
@@ -344,7 +610,9 @@ class CatalogParser(HTMLParser):
                     "id": attrs["data-id"],
                     "slug": None,
                     "thumb": None,
-                    "categories": self._categories(attrs.get("class", "")),
+                    "categories": bounded(
+                        self._categories(clip(attrs.get("class", ""))), 50
+                    ),
                 }
                 self._depth = 1
                 self._text = []
@@ -354,15 +622,18 @@ class CatalogParser(HTMLParser):
             self._depth += 1
 
         if tag == "a" and not self._current["slug"]:
-            href = attrs.get("href", "")
+            href = clip(attrs.get("href", ""))
             match = re.search(r"/playlist/([^/?#]+)/?", href)
-            if match:
+            if match and SLUG_RE.match(match.group(1)):
                 self._current["slug"] = match.group(1)
 
         if tag == "img" and not self._current["thumb"]:
-            src = attrs.get("data-lazysrc") or attrs.get("src") or ""
+            src = clip(attrs.get("data-lazysrc") or attrs.get("src") or "")
             if src and "25x25" not in src:
-                self._current["thumb"] = src
+                # Scraped straight out of the listing HTML, so it gets the same
+                # allowlist as any other remote URL — this one ends up as an
+                # Image source in the bar and the panel.
+                self._current["thumb"] = safe_thumb(src)
 
     def handle_endtag(self, tag):
         if self._current is None or tag != "li":
@@ -379,7 +650,8 @@ class CatalogParser(HTMLParser):
         item["durationHint"] = duration.group(1).strip() if duration else None
         item["title"] = slug_to_title(item["slug"])
         item["titleSource"] = "slug"
-        self.items.append(item)
+        if len(self.items) < MAX_CATALOG_ITEMS:
+            self.items.append(item)
 
     def handle_data(self, data):
         if self._current is not None:
@@ -442,6 +714,8 @@ def build_catalog(session: Session) -> dict:
         for item in parser.items:
             existing = merged.get(item["id"])
             if existing is None:
+                if len(merged) >= MAX_CATALOG_ITEMS:
+                    continue
                 merged[item["id"]] = item
             else:
                 # Later pages only contribute categories the first one missed.
@@ -452,7 +726,7 @@ def build_catalog(session: Session) -> dict:
     if not merged:
         raise NwError("no sessions found on any listing page", "parse")
 
-    details = read_json(DETAIL_FILE, {})
+    details = read_details()
     for item in merged.values():
         known = details.get(item["id"])
         if known and known.get("title"):
@@ -485,11 +759,23 @@ def load_catalog(session: Session, refresh: bool = False) -> dict:
     return catalog
 
 
-def catalog_index(catalog: dict) -> dict:
+def catalog_index(catalog) -> dict:
+    """Map id and slug to catalogue entries.
+
+    Tolerant by design: the catalogue may be absent, half-written, from an
+    older version, or rejected by read_json for being oversized, and callers
+    treat a missing entry as "not in the catalogue" rather than an error.
+    """
     index = {}
-    for item in catalog["sessions"]:
-        index[item["id"]] = item
-        index[item["slug"]] = item
+    if not isinstance(catalog, dict):
+        return index
+    for item in catalog.get("sessions") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("id"):
+            index[item["id"]] = item
+        if item.get("slug"):
+            index[item["slug"]] = item
     return index
 
 
@@ -513,18 +799,22 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
     CDN url, the real title and the cover — 600 bytes instead of the 370 KB
     session page, so this is what we ask for.
     """
-    details = read_json(DETAIL_FILE, {})
+    # key reaches here straight from the playSession IPC method.
+    key = valid_key(key)
+
+    details = read_details()
     catalog = read_json(CATALOG_FILE, None)
     index = catalog_index(catalog) if catalog else {}
 
     item = index.get(key)
-    post_id = item["id"] if item else (key if str(key).isdigit() else None)
+    post_id = item["id"] if item else (key if key.isdigit() else None)
 
     if not force and post_id and details.get(post_id, {}).get("audio"):
         return details[post_id]
 
     if post_id is None:
         # A slug we have never seen: the session page tells us its post id.
+        # key is slug-shaped by now, so it cannot escape this path segment.
         page = session.get_page(f"/playlist/{key}/")
         id_match = re.search(r'data-elementor-id="(\d+)"', page.text)
         if not id_match:
@@ -532,32 +822,50 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
         post_id = id_match.group(1)
         item = index.get(post_id) or item
 
+    post_id = valid_id(post_id)
     resp = session.get_page(f"/?load=playlist.json&albums={post_id}")
     try:
         data = json.loads(resp.text)
     except ValueError:
         raise NwError(f"session {post_id} returned no playlist", "parse") from None
 
-    tracks = [t for t in (data.get("tracks") or []) if t.get("mp3")]
+    if not isinstance(data, dict):
+        raise NwError(f"session {post_id} returned no playlist", "parse")
+    tracks = [
+        t for t in bounded(data.get("tracks"), MAX_TRACKS)
+        if isinstance(t, dict) and t.get("mp3")
+    ]
     if not tracks:
         raise NwError(f"session {post_id} has no audio track", "no-audio")
 
     first = tracks[0]
-    title = (first.get("album_title") or first.get("track_title") or "").strip()
-    poster = (first.get("poster") or "").strip()
+    title = clip(first.get("album_title") or first.get("track_title")).strip()
+    poster = clip(first.get("poster")).strip()
+
+    # Both URLs come from the response body, so neither is trusted: the audio
+    # url goes to mpv and the downloader, the thumb into an Image source.
+    audio = check_url(html.unescape(clip(first["mp3"])), AUDIO_HOSTS, "audio")
+    thumb = html.unescape(poster) if poster else None
+    if thumb:
+        try:
+            thumb = check_url(thumb, IMAGE_HOSTS, "artwork")
+        except NwError:
+            thumb = None      # cover art is optional; drop it rather than fail
+    if not thumb and item:
+        thumb = item.get("thumb")
 
     detail = {
         "id": post_id,
         "slug": item.get("slug") if item else None,
         "title": clean_title(title) if title else (
-            item.get("title") if item else slug_to_title(str(key))
+            item.get("title") if item else slug_to_title(key)
         ),
-        "artist": (first.get("album_artist") or "").strip() or None,
-        "audio": html.unescape(first["mp3"]),
-        "thumb": html.unescape(poster) or (item.get("thumb") if item else None),
+        "artist": clip(first.get("album_artist")).strip() or None,
+        "audio": audio,
+        "thumb": thumb,
         "url": f"{SITE}/playlist/{item['slug']}/" if item and item.get("slug")
                else f"{SITE}/?p={post_id}",
-        "categories": item.get("categories", []) if item else [],
+        "categories": bounded(item.get("categories"), 50) if item else [],
         "trackCount": len(tracks),
         "resolvedAt": int(time.time()),
     }
@@ -580,39 +888,111 @@ def playable(detail: dict) -> dict:
 # --------------------------------------------------------------------------
 
 
+AUDIO_SUFFIXES = (".mp3", ".m4a", ".ogg", ".opus", ".wav")
+
+
 def cached_path(post_id: str) -> Path | None:
+    """Look for an offline copy by exact name.
+
+    Deliberately not a glob: post_id reaches here from the public playSession
+    IPC method, and a glob pattern would let a caller probe outside the id it
+    named. valid_id also rules out separators before we build the path.
+    """
     if not AUDIO_DIR.exists():
         return None
-    for path in AUDIO_DIR.glob(f"{post_id}.*"):
-        if path.is_file() and path.stat().st_size > 0:
-            return path
+    # A lookup, so an id we would never have written is simply a miss. Raising
+    # here would turn one malformed search result into a failure of the whole
+    # search, and would make an unexpected file in the cache unremovable.
+    try:
+        post_id = valid_id(post_id)
+    except NwError:
+        return None
+    for suffix in AUDIO_SUFFIXES:
+        path = AUDIO_DIR / f"{post_id}{suffix}"
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+        except OSError:
+            continue
     return None
+
+
+def sweep_partials() -> None:
+    """Delete half-written downloads left behind by an earlier run.
+
+    The watchdog in the QML layer kills a helper that overruns its deadline, and
+    a caching download is the one operation big enough to hit that. The signal
+    handler installed in main() normally lets the `finally` in download_audio
+    unlink the temporary file, but a SIGKILL, a power cut or an older build all
+    leave one behind, where it shows up in `cache list` as a bogus track.
+    """
+    if not AUDIO_DIR.exists():
+        return
+    # Only sweep partials that nothing could still be writing. Several helper
+    # processes can run at once — the QML starts them independently, and the
+    # user may run the CLI alongside — so deleting every tmp* would let a
+    # `cache list` in a terminal destroy an in-flight download.
+    cutoff = time.time() - 3600
+    for path in AUDIO_DIR.glob("tmp*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
 
 
 def download_audio(session: Session, detail: dict) -> Path:
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    existing = cached_path(detail["id"])
+    sweep_partials()
+    post_id = valid_id(detail["id"])
+    existing = cached_path(post_id)
     if existing:
         return existing
 
-    suffix = Path(urllib.parse.urlparse(detail["audio"]).path).suffix or ".mp3"
-    target = AUDIO_DIR / f"{detail['id']}{suffix}"
+    url = check_url(detail.get("audio"), AUDIO_HOSTS, "audio")
+    suffix = Path(urllib.parse.urlsplit(url).path).suffix.lower()
+    if suffix not in AUDIO_SUFFIXES:
+        suffix = ".mp3"
+    target = AUDIO_DIR / f"{post_id}{suffix}"
 
-    req = urllib.request.Request(detail["audio"], headers={"User-Agent": UA})
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req.nw_allowed_hosts = AUDIO_HOSTS
+    req.nw_what = "audio"
     tmp = None
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with session.opener.open(req, timeout=60) as resp:
+            if declared_too_large(resp, MAX_AUDIO_BYTES):
+                raise NwError("audio file is too large to cache", "too-large")
             with tempfile.NamedTemporaryFile(
                 dir=AUDIO_DIR, delete=False
             ) as handle:
                 tmp = Path(handle.name)
-                shutil.copyfileobj(resp, handle, length=1 << 20)
+                written = 0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_AUDIO_BYTES:
+                        raise NwError(
+                            "audio file is too large to cache", "too-large"
+                        )
+                    handle.write(chunk)
+        try:
+            tmp.replace(target)
+        except OSError as exc:
+            raise NwError(f"download failed: {exc}", "io") from exc
+        tmp = None
+        return target
     except urllib.error.URLError as exc:
-        if tmp and tmp.exists():
-            tmp.unlink()
         raise NwError(f"download failed: {exc.reason}", "network") from exc
-    tmp.replace(target)
-    return target
+    finally:
+        # Never leave a half-written file behind, whatever went wrong.
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -637,7 +1017,8 @@ def favorite_ids(session: Session) -> list[str]:
         headers={"X-Requested-With": "XMLHttpRequest"},
     )
     raw = resp.text.strip().strip('"')
-    return [part for part in raw.split(",") if part.strip().isdigit()]
+    ids = [part.strip() for part in raw.split(",", MAX_FAVORITES)]
+    return [i for i in ids[:MAX_FAVORITES] if i.isdigit() and len(i) <= MAX_ID_LEN]
 
 
 def set_favorite_ids(session: Session, ids: list[str]) -> None:
@@ -656,7 +1037,7 @@ def set_favorite_ids(session: Session, ids: list[str]) -> None:
 def favorites_view(session: Session, ids: list[str]) -> list[dict]:
     catalog = load_catalog(session)
     index = catalog_index(catalog)
-    details = read_json(DETAIL_FILE, {})
+    details = read_details()
 
     # A few sessions (YouTube ones especially) never appear on a listing page.
     # Resolve those directly so a favorite is never a bare post id.
@@ -706,6 +1087,7 @@ def api_search(mode: str, query: str, user_id) -> list[dict]:
         payload["userId"] = user_id
     body = json.dumps(payload).encode()
 
+    endpoint = check_url(endpoint, API_HOSTS, "search api")
     req = urllib.request.Request(
         endpoint,
         data=body,
@@ -715,23 +1097,36 @@ def api_search(mode: str, query: str, user_id) -> list[dict]:
             "User-Agent": UA,
         },
     )
+    req.nw_allowed_hosts = API_HOSTS
+    req.nw_what = "search api"
+    opener = urllib.request.build_opener(AllowlistRedirectHandler)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
+        with opener.open(req, timeout=30) as resp:
+            if declared_too_large(resp, MAX_JSON_BYTES):
+                raise NwError("search API response is too large", "too-large")
+            data = json.loads(
+                read_capped(resp, MAX_JSON_BYTES, "search api")
+                .decode("utf-8", "replace")
+            )
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:200]
-        raise NwError(f"search API {exc.code}: {detail}", "api") from exc
+        detail = read_capped(exc, MAX_ERROR_BYTES, "search api")
+        raise NwError(
+            f"search API {exc.code}: {detail.decode('utf-8', 'replace')[:200]}",
+            "api",
+        ) from exc
     except urllib.error.URLError as exc:
         raise NwError(f"network error: {exc.reason}", "network") from exc
+    except ValueError as exc:
+        raise NwError(f"search API returned malformed JSON: {exc}", "parse") from exc
 
     if mode == "ai":
-        return flatten_recommendations(data)
+        return bounded(flatten_recommendations(data), MAX_SEARCH_RESULTS)
     if isinstance(data, dict):
         for key in ("sessions", "results"):
             if isinstance(data.get(key), list):
-                return data[key]
+                return bounded(data[key], MAX_SEARCH_RESULTS)
         return []
-    return data if isinstance(data, list) else []
+    return bounded(data, MAX_SEARCH_RESULTS) if isinstance(data, list) else []
 
 
 def flatten_recommendations(data) -> list[dict]:
@@ -789,15 +1184,24 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
     except NwError:
         catalog = {"sessions": []}
     index = catalog_index(catalog)
-    details = read_json(DETAIL_FILE, {})
+    details = read_details()
 
     # The search API is the cheapest source of real titles — the listing grid
     # only carries cover images, so keep every title the search hands us.
     learned = False
     for entry in results:
-        post_id = str(entry.get("id") or "")
-        title = (entry.get("title") or "").strip()
-        if not post_id or not title:
+        # id and title come from the search API and are written straight into
+        # details.json, so an unvalidated id would let a hostile response add
+        # unbounded keys until the cache blew past MAX_CACHE_BYTES and was
+        # silently discarded, taking every learned title with it.
+        try:
+            post_id = valid_id(entry.get("id"))
+        except NwError:
+            continue
+        title = clip(entry.get("title")).strip()
+        if not title:
+            continue
+        if post_id not in details and len(details) >= MAX_DETAIL_ENTRIES:
             continue
         detail = details.setdefault(post_id, {"id": post_id})
         if detail.get("title") != title and detail.get("titleSource") != "page":
@@ -809,7 +1213,13 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
 
     out = []
     for entry in results:
-        post_id = str(entry.get("id") or "")
+        # Validated on the way out too: this id is what the QML will hand back
+        # to playSession/toggleFavorite/cache, so it should never be a shape we
+        # would refuse to accept from anywhere else.
+        try:
+            post_id = valid_id(entry.get("id"))
+        except NwError:
+            continue
         item = index.get(post_id, {})
         detail = details.get(post_id, {})
         out.append(
@@ -921,7 +1331,11 @@ def cmd_status(session: Session, args) -> dict:
         "userId": cfg.get("userId"),
         "catalogCount": catalog.get("count") if catalog else 0,
         "catalogAge": int(time.time() - catalog["fetchedAt"]) if catalog else None,
-        "cachedTracks": len([p for p in cached if p.is_file()]),
+        # tmp* are partial downloads, not tracks — `cache list` filters them
+        # the same way, and the two counts should never disagree.
+        "cachedTracks": len([
+            p for p in cached if p.is_file() and not p.name.startswith("tmp")
+        ]),
     }
 
 
@@ -953,7 +1367,7 @@ def cmd_favorites(session: Session, args) -> dict:
 
 def cmd_fav(session: Session, args) -> dict:
     ids = favorite_ids(session)
-    post_id = str(args.id)
+    post_id = valid_id(args.id)
     if args.action == "add" and post_id not in ids:
         ids.append(post_id)
     elif args.action == "remove" and post_id in ids:
@@ -1000,9 +1414,10 @@ def cmd_cache(session: Session, args) -> dict:
     if args.action == "list":
         entries = []
         if AUDIO_DIR.exists():
-            details = read_json(DETAIL_FILE, {})
-            for path in sorted(AUDIO_DIR.glob("*")):
-                if not path.is_file():
+            details = read_details()
+            sweep_partials()
+            for path in sorted(AUDIO_DIR.glob("*"))[:MAX_CATALOG_ITEMS]:
+                if not path.is_file() or path.name.startswith("tmp"):
                     continue
                 post_id = path.stem
                 entries.append(
@@ -1015,7 +1430,14 @@ def cmd_cache(session: Session, args) -> dict:
                 )
         return {"ok": True, "count": len(entries), "tracks": entries}
 
-    post_id = str(args.id)
+    # Accepts an id or a slug. Cached files are named by post id, so a slug has
+    # to be mapped through the catalogue first — otherwise `cache remove <slug>`
+    # silently reports success while removing nothing.
+    post_id = valid_key(args.id)
+    if not post_id.isdigit():
+        entry = catalog_index(read_json(CATALOG_FILE, None) or {}).get(post_id)
+        if entry and entry.get("id"):
+            post_id = valid_id(entry["id"])
     if args.action == "add":
         detail = resolve_detail(session, post_id)
         path = download_audio(session, detail)
@@ -1030,7 +1452,7 @@ def cmd_cache(session: Session, args) -> dict:
 def cmd_enrich(session: Session, args) -> dict:
     """Fill in real titles + audio urls for sessions we have not opened yet."""
     catalog = load_catalog(session)
-    details = read_json(DETAIL_FILE, {})
+    details = read_details()
     pending = [s for s in catalog["sessions"] if s["id"] not in details]
     done, failed = 0, 0
     for item in pending[: args.limit]:
@@ -1117,19 +1539,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def on_terminate(signum, frame):
+    """Turn SIGTERM into a normal unwind.
+
+    Without this the default disposition kills the process outright and every
+    `finally` is skipped — including the one that removes a partly downloaded
+    file. The QML watchdog sends exactly this signal, so a slow download that
+    overruns its deadline would otherwise always leave an orphan behind.
+    """
+    raise SystemExit(143)
+
+
+def emit(payload) -> None:
+    """Print one JSON object, never more than MAX_OUTPUT_BYTES of it."""
+    body = json.dumps(payload, ensure_ascii=False)
+    if len(body.encode("utf-8")) + 1 > MAX_OUTPUT_BYTES:   # +1 for the newline
+        body = json.dumps({
+            "ok": False,
+            "error": "response too large to return",
+            "code": "too-large",
+        })
+    sys.stdout.write(body + "\n")
+
+
 def main(argv: list[str]) -> int:
+    signal.signal(signal.SIGTERM, on_terminate)
     args = build_parser().parse_args(argv)
     session = Session()
     try:
         result = args.func(session, args)
     except NwError as exc:
-        json.dump({"ok": False, "error": str(exc), "code": exc.code}, sys.stdout)
-        sys.stdout.write("\n")
+        emit({"ok": False, "error": str(exc), "code": exc.code})
         return 1
     except KeyboardInterrupt:
         return 130
-    json.dump(result, sys.stdout, ensure_ascii=False)
-    sys.stdout.write("\n")
+    emit(result)
     return 0
 
 
