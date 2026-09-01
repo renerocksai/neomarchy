@@ -13,7 +13,7 @@ Item {
   property bool opened: false
   property bool closingFromHost: false
 
-  readonly property string pluginId: "org.renerocksai.neomarchy"
+  readonly property string pluginId: "io.github.renerocksai.neomarchy"
   readonly property color foreground: Color.foreground
   readonly property color background: Color.background
   readonly property color accent: Color.accent

@@ -1,9 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "org.renerocksai.neomarchy",
+  "id": "io.github.renerocksai.neomarchy",
   "name": "neomarchy",
   "version": "0.1.0",
+  "author": "Rene Schallner",
   "description": "Search, favorite and play neowake sessions from the bar.",
+  "license": "MIT",
   "kinds": [
     "service",
     "bar-widget",

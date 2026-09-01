@@ -7,10 +7,10 @@ import qs.Commons
 
 BarWidget {
   id: root
-  moduleName: "org.renerocksai.neomarchy"
+  moduleName: "io.github.renerocksai.neomarchy"
 
   readonly property var service: bar && bar.shell
-    ? bar.shell.firstPartyServiceFor("org.renerocksai.neomarchy") : null
+    ? bar.shell.firstPartyServiceFor("io.github.renerocksai.neomarchy") : null
 
   readonly property bool showTitle: setting("showTrackTitle", "On") === "On"
   readonly property real barTextCap: Number(setting("maxBarTextWidth", "220")) || 0
@@ -189,7 +189,7 @@ BarWidget {
   function openFullPanel() {
     popupOpen = false
     if (bar && bar.shell)
-      bar.shell.summon("org.renerocksai.neomarchy", "{}")
+      bar.shell.summon("io.github.renerocksai.neomarchy", "{}")
   }
 
   function formatTime(seconds) {
@@ -672,7 +672,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "org.renerocksai.neomarchy.player"
+    target: "io.github.renerocksai.neomarchy.player"
 
     function toggle(): string {
       root.service ? root.service.togglePlayback() : null

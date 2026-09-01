@@ -41,12 +41,12 @@ Everything is already on a stock Omarchy box:
 omarchy plugin add https://github.com/renerocksai/neomarchy --enable
 ```
 
-That clones the repo into `~/.config/omarchy/plugins/org.renerocksai.neomarchy/`
+That clones the repo into `~/.config/omarchy/plugins/io.github.renerocksai.neomarchy/`
 and asks where to put the bar widget. Without `--enable` it lands disabled so
 you can read the code first — plugins run unsandboxed inside `omarchy-shell`.
 
-Later: `omarchy plugin update org.renerocksai.neomarchy` (shows a diff and
-fast-forwards), `omarchy plugin remove org.renerocksai.neomarchy`.
+Later: `omarchy plugin update io.github.renerocksai.neomarchy` (shows a diff and
+fast-forwards), `omarchy plugin remove io.github.renerocksai.neomarchy`.
 
 ## Sign in
 
@@ -54,7 +54,7 @@ Either from the panel (click the bar icon → **Open** → sign in), or from a
 terminal:
 
 ```bash
-~/.config/omarchy/plugins/org.renerocksai.neomarchy/bin/neowake login
+~/.config/omarchy/plugins/io.github.renerocksai.neomarchy/bin/neowake login
 ```
 
 It asks for your neowake username (or the email you sign in with) and your
@@ -101,17 +101,17 @@ The widget exposes IPC methods, so you can bind anything in
 `~/.config/hypr/bindings.lua`:
 
 ```bash
-omarchy-shell -q org.renerocksai.neomarchy.player toggle        # play/pause
-omarchy-shell -q org.renerocksai.neomarchy.player stop
-omarchy-shell -q org.renerocksai.neomarchy.player next          # next favorite
-omarchy-shell -q org.renerocksai.neomarchy.player previous
-omarchy-shell -q org.renerocksai.neomarchy.player volumeUp
-omarchy-shell -q org.renerocksai.neomarchy.player volumeDown
-omarchy-shell -q org.renerocksai.neomarchy.player miniPlayer    # toggle the popup
-omarchy-shell -q org.renerocksai.neomarchy.player playFavorite 0
-omarchy-shell -q org.renerocksai.neomarchy.player playSession 280824
-omarchy-shell    org.renerocksai.neomarchy.player state         # JSON status
-omarchy-shell    shell toggle org.renerocksai.neomarchy '{}'    # the full panel
+omarchy-shell -q io.github.renerocksai.neomarchy.player toggle        # play/pause
+omarchy-shell -q io.github.renerocksai.neomarchy.player stop
+omarchy-shell -q io.github.renerocksai.neomarchy.player next          # next favorite
+omarchy-shell -q io.github.renerocksai.neomarchy.player previous
+omarchy-shell -q io.github.renerocksai.neomarchy.player volumeUp
+omarchy-shell -q io.github.renerocksai.neomarchy.player volumeDown
+omarchy-shell -q io.github.renerocksai.neomarchy.player miniPlayer    # toggle the popup
+omarchy-shell -q io.github.renerocksai.neomarchy.player playFavorite 0
+omarchy-shell -q io.github.renerocksai.neomarchy.player playSession 280824
+omarchy-shell    io.github.renerocksai.neomarchy.player state         # JSON status
+omarchy-shell    shell toggle io.github.renerocksai.neomarchy '{}'    # the full panel
 ```
 
 ## Settings
@@ -178,7 +178,7 @@ The installed plugin directory **is** the git checkout — that is how Omarchy
 plugins work — so hack on it in place:
 
 ```bash
-cd ~/.config/omarchy/plugins/org.renerocksai.neomarchy
+cd ~/.config/omarchy/plugins/io.github.renerocksai.neomarchy
 ```
 
 Saving any file under `~/.config/omarchy/plugins/` hot-reloads the plugin code;
