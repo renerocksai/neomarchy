@@ -27,7 +27,6 @@ Item {
     && (searching ? service.searchLoading : service.favoritesLoading)
 
   property int selectedIndex: -1
-  property string otpCode: ""
 
   // ------------------------------------------------------------------ host
 
@@ -332,6 +331,8 @@ Item {
             id: bannerText
             anchors.centerIn: parent
             width: parent.width - Style.space(20)
+            // Helper errors can quote server-supplied text; keep it literal.
+            textFormat: Text.PlainText
             text: root.service
               ? (root.service.lastError !== ""
                 ? root.service.lastError : root.service.statusMessage) : ""
@@ -492,20 +493,11 @@ Item {
               onAccepted: root.submitLogin()
             }
 
-            TextField {
-              id: otpField
-              width: parent.width
-              visible: root.service && root.service.loginNeedsOtp
-              foreground: root.foreground
-              accent: root.accent
-              placeholderText: "Two-factor code"
-              font.family: root.fontFamily
-              onAccepted: root.submitLogin()
-            }
-
             Text {
               width: parent.width
               visible: root.service && root.service.loginError !== ""
+              // The login failure reason is lifted out of the site's HTML.
+              textFormat: Text.PlainText
               text: root.service ? root.service.loginError : ""
               color: Color.urgent
               font.family: root.fontFamily
@@ -607,6 +599,7 @@ Item {
 
               width: list.width
               item: modelData
+              artSource: root.service ? root.service.artUrl(modelData) : ""
               rowIndex: index
               foreground: root.foreground
               accent: root.accent
@@ -693,6 +686,7 @@ Item {
 
             Text {
               width: parent.width
+              textFormat: Text.PlainText
               text: root.service ? root.service.trackTitle : ""
               color: root.foreground
               font.family: root.fontFamily
@@ -838,8 +832,7 @@ Item {
   function submitLogin() {
     if (!service)
       return
-    service.login(userField.text.trim(), passField.text,
-      otpField.visible ? otpField.text.trim() : "")
+    service.login(userField.text.trim(), passField.text)
     passField.text = ""
   }
 

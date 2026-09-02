@@ -10,9 +10,14 @@ Omarchy status bar — without opening a browser.
 - **Panel** (`Super`-summonable) with four search modes, your favorites, cover
   art, transport and volume.
 - **Playback** through `mpv`, which means real MPRIS integration: your media
-  keys work, and any other MPRIS client sees the session.
+  keys work, and any other MPRIS client sees the session. mpv only ever plays
+  local files: the helper downloads the audio (pinned to neowake's CDN hosts,
+  size-capped) while mpv follows the growing file, so playback still starts
+  immediately.
 - **Favorites** are read from and written back to your neowake account.
 - **Offline**: keep a session on disk and it plays from there next time.
+  A session fetched only for playback is removed again when you move on,
+  unless `cacheOnPlay` is set.
 
 ## Screenshots
 
@@ -61,8 +66,8 @@ It asks for your neowake username (or the email you sign in with) and your
 password. The password goes straight into the GNOME keyring via `secret-tool`
 and is never written to a config file; the WordPress session cookie lands in
 `~/.local/state/neowake/cookies.txt` with mode 600. When the cookie expires the
-helper logs in again on its own. If your account has two-factor enabled, the
-panel asks for the code (`--otp <code>` on the command line).
+helper logs in again on its own. neowake accounts have no second factor, so
+username and password are the only credentials the plugin ever handles.
 
 ## Using it
 
@@ -126,7 +131,6 @@ Set per-widget in `~/.config/omarchy/shell.json`:
 | `repeat` | `Off` | loop the running session |
 | `cacheOnPlay` | `Off` | keep every played session offline |
 | `volumeStep` | `5` | scroll-wheel step, in percent |
-| `catalogRefreshDays` | `7` | how often to re-crawl the catalog |
 
 ## The helper
 
@@ -141,33 +145,48 @@ neowake fav add|remove|toggle <id>
 neowake search <query> [--mode keyword|local|ai|frequency] [--limit N]
 neowake resolve <id-or-slug> [--download]
 neowake cache add|remove|list [<id>]
+neowake artwork <id>...           # fetch cover art to local files
 neowake enrich [--limit N]        # backfill titles, covers and audio urls
 neowake logout [--forget]
 ```
 
+Every invocation takes `--budget <seconds>`, a hard wall-clock deadline for
+the whole run; the plugin passes one on every call, a few seconds under its
+own watchdog timeout, so the helper always unwinds (and cleans up) on its
+own before it would ever have to be signalled.
+
 ## How it works
 
 ```
-BarWidget.qml / Panel.qml   the UI
+BarWidget.qml / Panel.qml   the UI; covers load from local files only
 Service.qml                 state; owns one mpv, driven over its JSON IPC socket
-  ├── mpv --idle            plays the CDN url (or the offline copy)
-  │     └── mpv-mpris       so media keys and other MPRIS clients see it
-  └── bin/neowake           login, catalog, favorites, search, url resolution
+  ├── mpv --idle            plays local files only (offline copy, or the
+  │     └── mpv-mpris       file the helper is downloading, as it grows)
+  └── bin/neowake           the ONLY thing that talks to the network:
+                            login, catalog, favorites, search, downloads
 ```
 
 Session discovery uses neowake's own search API, which needs no login. Your
 favorites, the catalog and the audio URLs come from the membership site with
-your session cookie. Audio streams from neowake's CDN.
+your session cookie. Audio and cover art are downloaded by the helper — every
+URL, and every redirect hop, is checked against a pinned host allowlist, and
+every response is size-capped — into local files, which are all mpv and the
+UI ever see. Neither mpv nor Qt ever get handed a remote URL, and mpv runs
+with `--ytdl=no --access-references=no`, so a local file cannot send it to
+the network either (a playlist under an audio name would otherwise do that).
+The downloader also refuses a body that starts like text or a playlist.
 
-Local data lives in `~/.local/state/neowake/`:
+Local data lives in `~/.local/state/neowake/` (directories mode 700, files
+600, all I/O descriptor-relative and symlink-rejecting):
 
 | | |
 |---|---|
-| `cookies.txt` | the WordPress session (mode 600) |
+| `cookies.txt` | the WordPress session |
 | `catalog.json` | ~500 sessions: id, slug, categories, cover |
 | `details.json` | resolved titles, covers and audio urls |
 | `favorites.json` | short-lived cache of the favorite ids |
-| `audio/` | offline copies |
+| `audio/` | offline copies (`partial-*` while downloading) |
+| `artwork/` | cover images, fetched by the helper |
 
 Your username is in `~/.config/neowake/config.json`; the password is only ever
 in the keyring.

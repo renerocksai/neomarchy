@@ -4,6 +4,13 @@ import Quickshell.Io
 
 // Shared state for the neomarchy plugin: one mpv instance driven over its JSON
 // IPC socket, and every piece of catalogue data fetched through bin/neowake.
+//
+// mpv and Qt never see a remote URL. Audio is streamed by the helper — the
+// only process that talks to the network, behind its host allowlist and byte
+// caps — into a local file that mpv follows while it grows (appending://).
+// Cover art likewise arrives as local files via the helper's `artwork`
+// command. The QML layer deals exclusively in ids, local paths, and the
+// helper's JSON.
 Item {
   id: root
 
@@ -12,8 +19,29 @@ Item {
 
   // ---------------------------------------------------------------- helper
 
-  readonly property string helperPath:
-    String(Qt.resolvedUrl("bin/neowake")).replace(/^file:\/\//, "")
+  // resolvedUrl percent-encodes, argv wants the bytes: a plugin directory
+  // with a space in its path would otherwise yield "bin%20neowake".
+  readonly property string helperPath: decodeURIComponent(
+    String(Qt.resolvedUrl("bin/neowake")).replace(/^file:\/\//, ""))
+
+  // Every helper invocation carries a --budget a few seconds under the QML
+  // deadline for that operation, so the helper unwinds cleanly — running its
+  // cleanup `finally` blocks — before the watchdog here ever has to signal
+  // it, and --own-process-group so that one group signal from the watchdog
+  // takes the helper down together with anything it started (secret-tool,
+  // for instance) even if the helper itself is beyond reasoning with.
+  function helperArgv(args, timeoutMs) {
+    var budget = Math.max(5, Math.round((timeoutMs || helperTimeoutMs) / 1000) - 5)
+    return [helperPath, "--budget", String(budget), "--own-process-group"]
+      .concat(args)
+  }
+
+  // The two id shapes the helper accepts (numeric post id, kebab-case slug).
+  // Checked at every QML entry point too — the public IPC methods land here —
+  // so nothing else even reaches a helper command line.
+  function validSessionKey(key) {
+    return /^[0-9]{1,32}$/.test(key) || /^[a-z0-9][a-z0-9-]{0,127}$/.test(key)
+  }
 
   // ---------------------------------------------------------------- account
 
@@ -26,7 +54,6 @@ Item {
   property bool statusLoading: false
 
   property bool loginBusy: false
-  property bool loginNeedsOtp: false
   property string loginError: ""
 
   // ---------------------------------------------------------------- library
@@ -61,7 +88,7 @@ Item {
 
   readonly property bool hasTrack: currentTrack !== null
   readonly property string trackTitle: currentTrack ? (currentTrack.title || "") : ""
-  readonly property string trackArtUrl: currentTrack ? (currentTrack.thumb || "") : ""
+  readonly property string trackArtUrl: currentTrack ? artUrl(currentTrack) : ""
   readonly property string trackId: currentTrack ? String(currentTrack.id || "") : ""
   readonly property bool currentIsFavorite: trackId !== "" && isFavorite(trackId)
 
@@ -122,11 +149,11 @@ Item {
   readonly property int helperTimeoutMs: 45000
   readonly property int catalogTimeoutMs: 300000
 
-  // Keeping a session offline downloads the whole file: a measured session is
-  // 216 MB, which the generic 45 s deadline could only ever meet on a ~38 Mbit
-  // link — below that the download would be killed every single time, and with
-  // cacheOnPlay enabled that is on every play. 30 minutes covers the same file
-  // on a ~1 Mbit connection.
+  // Playing an uncached session downloads the whole file (mpv follows the
+  // partial while it grows, so playback starts immediately): a measured
+  // session is 216 MB, which the generic 45 s deadline could only ever meet
+  // on a ~38 Mbit link. 30 minutes covers the same file on a ~1 Mbit
+  // connection.
   readonly property int downloadTimeoutMs: 1800000
 
   function parseHelper(raw) {
@@ -140,9 +167,16 @@ Item {
     }
   }
 
-  // Every helper run gets a deadline. Without this a wedged process would hold
-  // its StdioCollector, and the operation it belongs to, open forever.
+  // Every helper run gets a deadline, enforced in three layers: the helper's
+  // own --budget (it unwinds first, cleanly), then TERM to its process group,
+  // then — after a short grace — KILL to the group. The group signal matters
+  // because the helper may itself be blocked on a child such as secret-tool:
+  // signalling only the leader could leave that child running unwatched.
+  // Reaping is Quickshell's (the direct child) and init's (anything
+  // re-parented after a group KILL); nothing lingers as a zombie of ours.
   property var watchedProcs: []
+  property var pendingKills: []
+  readonly property int killGraceMs: 2000
 
   function guard(proc, label, timeoutMs) {
     // Replace any existing entry for this Process rather than appending. The
@@ -164,6 +198,64 @@ Item {
     watchdog.start()
   }
 
+  // Group signalling. Quickshell's Process.signal() only reaches the direct
+  // child, so the group signal goes through kill(1) with a negative pid. The
+  // direct signal is still sent as well: it covers the instant before the
+  // helper has moved into its own group, and any process not started with
+  // --own-process-group.
+  property var killQueue: []
+
+  function signalGroup(pid, sig) {
+    if (!pid)
+      return
+    killQueue.push({ pid: pid, sig: sig })
+    pumpKills()
+  }
+
+  function pumpKills() {
+    if (killProcess.running || killQueue.length === 0)
+      return
+    var next = killQueue.shift()
+    killProcess.command = ["kill", "-s", next.sig, "--", "-" + next.pid]
+    killProcess.running = true
+  }
+
+  // Exit status deliberately ignored: a group that is already gone makes
+  // kill(1) fail, and that is the outcome we wanted anyway.
+  Process { id: killProcess; onExited: root.pumpKills() }
+
+  function terminateTree(proc) {
+    var pid = proc.processId
+    proc.signal(15)
+    signalGroup(pid, "TERM")
+  }
+
+  function killTree(proc) {
+    var pid = proc.processId
+    proc.signal(9)
+    signalGroup(pid, "KILL")
+  }
+
+  // For a helper we end early on purpose (a superseded search or download):
+  // TERM now so it unwinds and cleans up after itself, and an unconditional
+  // group KILL a grace later in case it cannot. The KILL is addressed by pid,
+  // not Process object, because the Process is reused for the successor run.
+  //
+  // Addressing a pid that may already be dead is the one residual here: if
+  // the number were recycled within the 2 s grace by a new process that also
+  // became a group leader, the KILL would hit that instead. Linux hands out
+  // pids sequentially up to pid_max (4194304 on this platform), so that
+  // takes millions of process creations inside two seconds; and the target
+  // could only ever be another process of this same user.
+  function supersedeHelper(proc) {
+    var pid = proc.processId
+    terminateTree(proc)
+    if (pid) {
+      pendingKills = pendingKills.concat([{ pid: pid, at: Date.now() + killGraceMs }])
+      watchdog.start()
+    }
+  }
+
   Timer {
     id: watchdog
     interval: 1000
@@ -175,30 +267,39 @@ Item {
         var w = root.watchedProcs[i]
         if (!w.proc.running)
           continue
+        if (w.termAt !== undefined) {
+          // TERM was sent and it is still here. bin/neowake turns SIGTERM
+          // into a normal unwind (verified: exit 143, promptly, even
+          // mid-download), so the only way to reach the KILL is a helper
+          // wedged somewhere no Python signal handler runs.
+          if (now - w.termAt >= root.killGraceMs)
+            root.killTree(w.proc)
+          else
+            still.push(w)
+          continue
+        }
         if (now >= w.deadline) {
-          // One SIGTERM and we are done. bin/neowake installs a handler that
-          // turns it into a normal unwind, so the `finally` that removes a
-          // partly downloaded file runs and the process exits on its own
-          // (verified: exit 143, promptly, even mid-download).
-          //
-          // No SIGKILL escalation on purpose. It would only matter for a helper
-          // that ignores SIGTERM, which this one cannot, and the bookkeeping it
-          // needed — a grace deadline, a kill flag, a pid check to avoid
-          // signalling a successor — was itself the source of worse bugs than
-          // the one it prevented.
-          //
-          // Deliberately NOT `running = false`: on a Process whose child is
-          // still alive that does not terminate anything, it cancels the
-          // command a newer run has already queued on the same Process — so
-          // the user's next search or track would silently never start.
-          w.proc.signal(15)
+          root.terminateTree(w.proc)
           root.fail(w.label + " timed out")
+          w.termAt = now
+          still.push(w)
           continue
         }
         still.push(w)
       }
       root.watchedProcs = still
-      if (still.length === 0)
+
+      var kills = []
+      for (var k = 0; k < root.pendingKills.length; k++) {
+        var pending = root.pendingKills[k]
+        if (now >= pending.at)
+          root.signalGroup(pending.pid, "KILL")
+        else
+          kills.push(pending)
+      }
+      root.pendingKills = kills
+
+      if (still.length === 0 && kills.length === 0)
         stop()
     }
   }
@@ -206,7 +307,9 @@ Item {
   function helperFailed(payload, stderrText, fallback) {
     if (payload && payload.ok === false && payload.error)
       return String(payload.error)
-    var text = String(stderrText || "").trim()
+    // stderr is not capped by the helper the way stdout is (a traceback is
+    // whatever size it is), so only the tail is ever looked at.
+    var text = String(stderrText || "").slice(-4096).trim()
     if (text !== "")
       return text.split("\n").pop()
     return fallback
@@ -241,28 +344,28 @@ Item {
     if (statusProcess.running)
       return
     statusLoading = true
-    statusProcess.command = [helperPath, "status"]
+    statusProcess.command = helperArgv(["status"], helperTimeoutMs)
     statusProcess.running = true
     root.guard(statusProcess, "Status check")
   }
 
-  function login(user, password, otp) {
+  // Username/email and password — the only credentials neowake has. The
+  // password never touches the command line: it goes down the helper's
+  // stdin (see loginProcess.onStarted).
+  function login(user, password) {
     if (loginProcess.running || !user || !password)
       return
     loginBusy = true
     loginError = ""
-    loginNeedsOtp = false
     loginPassword = password
-    var argv = [helperPath, "login", "--user", String(user), "--password-stdin"]
-    if (otp && String(otp) !== "")
-      argv = argv.concat(["--otp", String(otp)])
-    loginProcess.command = argv
+    var argv = ["login", "--user", String(user), "--password-stdin"]
+    loginProcess.command = helperArgv(argv, 60000)
     loginProcess.running = true
     root.guard(loginProcess, "Sign-in", 60000)
   }
 
   function logout(forget) {
-    var argv = [helperPath, "logout"]
+    var argv = ["logout"]
     if (forget)
       argv.push("--forget")
     runAction(argv, "Signed out of neowake")
@@ -302,16 +405,10 @@ Item {
     onExited: function(exitCode) {
       root.loginBusy = false
       var payload = root.parseHelper(loginOut.text)
-      if (exitCode === 0 && payload && payload.state === "otp-required") {
-        root.loginNeedsOtp = true
-        root.loginError = "Two-factor code required"
-        return
-      }
       if (exitCode !== 0 || !payload || payload.ok !== true) {
         root.loginError = root.helperFailed(payload, loginErr.text, "Login failed")
         return
       }
-      root.loginNeedsOtp = false
       root.loginError = ""
       root.note("Signed in as " + (payload.username || ""))
       root.refreshStatus()
@@ -328,10 +425,10 @@ Item {
     if (favoritesProcess.running)
       return
     favoritesLoading = true
-    var argv = [helperPath, "favorites"]
+    var argv = ["favorites"]
     if (force)
       argv.push("--refresh")
-    favoritesProcess.command = argv
+    favoritesProcess.command = helperArgv(argv, helperTimeoutMs)
     favoritesProcess.running = true
     root.guard(favoritesProcess, "Loading favorites")
   }
@@ -341,9 +438,9 @@ Item {
   }
 
   function toggleFavorite(id) {
-    if (!id || favProcess.running)
+    var key = String(id || "")
+    if (!validSessionKey(key) || favProcess.running)
       return
-    var key = String(id)
     // Flip locally first; the helper answers with the authoritative value.
     var next = {}
     for (var existing in favoriteIds)
@@ -351,7 +448,7 @@ Item {
     next[key] = !isFavorite(key)
     favoriteIds = next
 
-    favProcess.command = [helperPath, "fav", "toggle", key]
+    favProcess.command = helperArgv(["fav", "toggle", key], helperTimeoutMs)
     favProcess.running = true
     root.guard(favProcess, "Updating favorite")
   }
@@ -404,9 +501,15 @@ Item {
   // showing a red error for something that went exactly as intended.
   property bool searchSuperseded: false
   property bool resolveSuperseded: false
+  property bool streamSuperseded: false
+
+  // Query length cap, mirrored by MAX_QUERY in the helper. Local mode runs a
+  // fuzzy match over the whole catalogue on every keystroke, and its cost
+  // grows with the query, so a pasted wall of text is cut before it goes out.
+  readonly property int maxQueryLength: 200
 
   function search(query, mode) {
-    var text = String(query || "").trim()
+    var text = String(query || "").trim().slice(0, maxQueryLength)
     searchQuery = text
     if (mode)
       searchMode = mode
@@ -417,11 +520,15 @@ Item {
     }
     if (searchProcess.running) {
       searchSuperseded = true
+      supersedeHelper(searchProcess)
       searchProcess.running = false
     }
 
     searchLoading = true
-    searchProcess.command = [helperPath, "search", text, "--mode", searchMode]
+    // "--" so that whatever was typed is the query, never an option: "-h"
+    // or "--limit 1" in the search box would otherwise be parsed as one.
+    searchProcess.command = helperArgv(
+      ["search", "--mode", searchMode, "--", text], helperTimeoutMs)
     searchProcess.running = true
     root.guard(searchProcess, "Search")
   }
@@ -429,6 +536,7 @@ Item {
   function clearSearch() {
     if (searchProcess.running) {
       searchSuperseded = true
+      supersedeHelper(searchProcess)
       searchProcess.running = false
     }
     searchLoading = false
@@ -468,10 +576,10 @@ Item {
     if (catalogProcess.running)
       return
     catalogRefreshing = true
-    var argv = [helperPath, "catalog"]
+    var argv = ["catalog"]
     if (force)
       argv.push("--refresh")
-    catalogProcess.command = argv
+    catalogProcess.command = helperArgv(argv, root.catalogTimeoutMs)
     catalogProcess.running = true
     root.guard(catalogProcess, "Catalog refresh", root.catalogTimeoutMs)
   }
@@ -489,25 +597,108 @@ Item {
   }
 
   // ------------------------------------------------------------------------
+  // artwork
+  // ------------------------------------------------------------------------
+
+  // Qt's Image element follows HTTP redirects on its own, outside any
+  // allowlist, so it is never handed a remote URL. Covers are fetched by the
+  // helper — same host allowlist as everything else, 4 MB cap, content
+  // sniffed — into ~/.local/state/neowake/artwork/, and the views load those
+  // files. artUrl() is what every Image binds through: a known local path,
+  // "" while unknown, and a request queued the first time an id shows up.
+  property var artworkPaths: ({})     // id -> "file://..." or "" (none/failed)
+  property var artworkPending: ({})   // ids queued or in flight this session
+  property var artworkQueue: []
+  property var artworkBatch: []
+
+  function artUrl(item) {
+    if (!item)
+      return ""
+    var id = String(item.id || "")
+    if (!/^[0-9]{1,32}$/.test(id))
+      return ""
+    var known = artworkPaths[id]
+    if (known !== undefined)
+      return known
+    // Only ask when our helper can know a cover for this id; the queue is
+    // filled from a binding, so the actual work is deferred out of it.
+    if (item.thumb)
+      queueArtwork(id)
+    return ""
+  }
+
+  function queueArtwork(id) {
+    if (artworkPending[id] === true || artworkQueue.length >= 100)
+      return
+    artworkPending[id] = true
+    artworkQueue.push(id)
+    Qt.callLater(root.pumpArtwork)
+  }
+
+  function pumpArtwork() {
+    if (artworkProcess.running || artworkQueue.length === 0)
+      return
+    artworkBatch = artworkQueue.splice(0, 12)
+    artworkProcess.command = helperArgv(["artwork"].concat(artworkBatch),
+      helperTimeoutMs)
+    artworkProcess.running = true
+    root.guard(artworkProcess, "Artwork fetch")
+  }
+
+  Process {
+    id: artworkProcess
+    stdout: StdioCollector { id: artworkOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var payload = root.parseHelper(artworkOut.text)
+      var table = payload && payload.ok === true && payload.artwork
+        ? payload.artwork : ({})
+      var next = {}
+      for (var known in root.artworkPaths)
+        next[known] = root.artworkPaths[known]
+      for (var i = 0; i < root.artworkBatch.length; i++) {
+        var id = root.artworkBatch[i]
+        var path = table[id]
+        // A failure is remembered as "" — no cover, no retry storm. Artwork
+        // is optional; there is deliberately no error banner for it.
+        next[id] = (typeof path === "string" && path.charAt(0) === "/")
+          ? "file://" + path : ""
+      }
+      root.artworkPaths = next
+      root.artworkBatch = []
+      if (root.artworkQueue.length > 0)
+        Qt.callLater(root.pumpArtwork)
+    }
+  }
+
+  // ------------------------------------------------------------------------
   // one-shot actions (cache, logout, enrich)
   // ------------------------------------------------------------------------
 
   property string actionSuccessNote: ""
 
-  function runAction(argv, successNote, timeoutMs) {
+  function runAction(args, successNote, timeoutMs) {
     if (actionProcess.running) {
       note("Still working on the last action")
       return
     }
     actionSuccessNote = successNote || ""
-    actionProcess.command = argv
+    actionProcess.command = helperArgv(args, timeoutMs)
     actionProcess.running = true
     root.guard(actionProcess, "Helper action", timeoutMs)
   }
 
   function cacheTrack(id) {
-    if (!id)
+    var key = String(id || "")
+    if (!validSessionKey(key))
       return
+    if (key === transientId || key === streamingId) {
+      // This session is (or just was) being fetched for playback anyway —
+      // keeping it offline only means not deleting it afterwards.
+      transientId = ""
+      note("Keeping this session offline")
+      refreshStatus()
+      return
+    }
     // Deliberately not runAction(): a download holds its Process for up to
     // downloadTimeoutMs, and actionProcess is shared with sign-out and with
     // removing an offline copy. Routing it through the shared Process left
@@ -516,15 +707,33 @@ Item {
       note("Already saving a session")
       return
     }
-    downloadProcess.command = [helperPath, "cache", "add", String(id)]
+    downloadProcess.command = helperArgv(["cache", "add", key], downloadTimeoutMs)
     downloadProcess.running = true
     root.guard(downloadProcess, "Saving for offline use", root.downloadTimeoutMs)
   }
 
   function uncacheTrack(id) {
-    if (!id)
+    var key = String(id || "")
+    if (!validSessionKey(key))
       return
-    runAction([helperPath, "cache", "remove", String(id)], "Removed the offline copy")
+    if (key === transientId)
+      transientId = ""      // being removed explicitly; nothing left to clean
+    dropLocalCopyState(key)
+    runAction(["cache", "remove", key], "Removed the offline copy")
+  }
+
+  // The file behind `id` is going away. If the current track points at it,
+  // drop that playUrl so a replay goes back through resolve instead of
+  // handing mpv a path that no longer exists.
+  function dropLocalCopyState(id) {
+    if (!currentTrack || String(currentTrack.id) !== String(id))
+      return
+    var merged = {}
+    for (var key in currentTrack)
+      merged[key] = currentTrack[key]
+    merged.cached = false
+    merged.playUrl = ""
+    currentTrack = merged
   }
 
   Process {
@@ -564,27 +773,44 @@ Item {
   property var pendingTrack: null
   property bool cacheOnPlay: false
 
+  // Streaming playback state. An uncached session is downloaded by the helper
+  // into audio/partial-<id>.<ext> while mpv follows that growing local file
+  // (appending://). When the download completes the partial becomes the
+  // cached copy and mpv is switched onto it at the current position.
+  property string streamingId: ""      // id whose download is playback-driven
+  property int streamRetries: 0        // loadfile attempts before the partial exists
+  property string transientId: ""      // downloaded only to play; removed later
+  property bool stopRequested: false
+  property real pendingSeekSeconds: 0
+
   function play(item) {
     if (!item)
       return
     var id = String(item.id || "")
+    if (!validSessionKey(id))
+      return
+    stopRequested = false
+    pendingSeekSeconds = 0
+    cleanupTransient(id)
     currentTrack = item
     positionSeconds = 0
-    lengthSeconds = Number(item.duration || 0) * 60 > 0 ? 0 : 0
+    lengthSeconds = 0
     buffering = true
     lastError = ""
 
-    if (item.playUrl) {
+    // Only a verified local copy plays directly; everything else goes back
+    // through resolve so the helper decides what is playable right now.
+    if (item.playUrl && String(item.playUrl).indexOf("file://") === 0) {
       startUrl(item.playUrl)
       return
     }
-    // Resolve id -> CDN url (or the offline copy) before handing it to mpv.
     pendingTrack = item
     if (resolveProcess.running) {
       resolveSuperseded = true
+      supersedeHelper(resolveProcess)
       resolveProcess.running = false
     }
-    resolveProcess.command = [helperPath, "resolve", id]
+    resolveProcess.command = helperArgv(["resolve", id], helperTimeoutMs)
     resolveProcess.running = true
     root.guard(resolveProcess, "Opening session")
   }
@@ -598,7 +824,7 @@ Item {
 
   function playById(id) {
     var key = String(id || "")
-    if (key === "")
+    if (!validSessionKey(key))
       return false
     for (var i = 0; i < favorites.length; i++) {
       if (String(favorites[i].id) === key) {
@@ -656,11 +882,145 @@ Item {
       merged.slug = payload.slug
       merged.title = payload.title || wanted.title
       merged.thumb = payload.thumb || wanted.thumb
-      merged.audio = payload.audio
-      merged.playUrl = payload.playUrl
       merged.cached = payload.cached === true
+      merged.playUrl = payload.playUrl ? String(payload.playUrl) : ""
+      merged.streamPath = payload.streamPath ? String(payload.streamPath) : ""
       root.currentTrack = merged
-      root.startUrl(payload.playUrl)
+
+      if (merged.playUrl.indexOf("file://") === 0)
+        root.startUrl(merged.playUrl)
+      else if (merged.streamPath !== "")
+        root.startStream(merged)
+      else {
+        root.buffering = false
+        root.fail("Could not open that session")
+      }
+    }
+  }
+
+  // Download-and-play: the helper streams the audio (allowlist on every
+  // redirect hop, 512 MB cap, private partial file) while mpv follows the
+  // partial. mpv itself never touches the network.
+  function startStream(item) {
+    var id = String(item.id || "")
+    if (id === "" || !item.streamPath)
+      return
+    if (streamProcess.running) {
+      streamSuperseded = true
+      supersedeHelper(streamProcess)
+      streamProcess.running = false
+    }
+    streamingId = id
+    streamRetries = 0
+    if (!cacheOnPlay && item.cached !== true)
+      transientId = id
+    streamProcess.command = helperArgv(["cache", "add", id], downloadTimeoutMs)
+    streamProcess.running = true
+    root.guard(streamProcess, "Fetching the session audio", root.downloadTimeoutMs)
+    startUrl("appending://" + String(item.streamPath))
+  }
+
+  // A session downloaded only because the user pressed play is removed again
+  // when they move on — unless cacheOnPlay is set, they pressed the keep
+  // button (cacheTrack clears transientId), or it is the very session being
+  // started (exceptId).
+  function cleanupTransient(exceptId) {
+    if (transientId === "" || transientId === String(exceptId))
+      return
+    var id = transientId
+    transientId = ""
+    dropLocalCopyState(id)
+    if (streamProcess.running && streamingId === id) {
+      // Still downloading: ending the helper discards the partial itself.
+      streamSuperseded = true
+      supersedeHelper(streamProcess)
+      streamProcess.running = false
+      streamingId = ""
+      return
+    }
+    runAction(["cache", "remove", id], "")
+  }
+
+  function markCurrentCached(path) {
+    if (!currentTrack)
+      return
+    var merged = {}
+    for (var key in currentTrack)
+      merged[key] = currentTrack[key]
+    merged.cached = true
+    merged.playUrl = "file://" + path
+    merged.streamPath = ""
+    currentTrack = merged
+  }
+
+  // The download finished: move mpv from the no-longer-growing partial onto
+  // the completed file, at the position it had reached. Without this, mpv's
+  // appending mode would wait forever for more data that is never coming.
+  function switchToCompleted(path) {
+    var target = String(path || "")
+    if (target.charAt(0) !== "/")
+      return
+    markCurrentCached(target)
+    if (!socketReady() || !fileLoaded) {
+      // Playback never latched onto the partial (a very fast download, or a
+      // container mpv cannot play while incomplete) — just play the file.
+      startUrl("file://" + target)
+      return
+    }
+    pendingSeekSeconds = Math.max(0, positionSeconds - 0.5)
+    sendMpv(["loadfile", target])
+    sendMpv(["set_property", "pause", false])
+  }
+
+  Process {
+    id: streamProcess
+    stdout: StdioCollector { id: streamOut; waitForEnd: true }
+    stderr: StdioCollector { id: streamErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (root.streamSuperseded) {
+        root.streamSuperseded = false
+        return
+      }
+      var streamed = root.streamingId
+      root.streamingId = ""
+      var payload = root.parseHelper(streamOut.text)
+      var current = root.currentTrack
+        && String(root.currentTrack.id) === streamed
+      if (exitCode !== 0 || !payload || payload.ok !== true) {
+        if (root.transientId === streamed)
+          root.transientId = ""
+        if (current) {
+          // The partial mpv is following just stopped growing for good (and
+          // the helper unlinked it) — stop chasing it.
+          root.stop()
+          root.fail(root.helperFailed(payload, streamErr.text,
+            "Could not fetch that session"))
+        }
+        root.refreshStatus()
+        return
+      }
+      if (current && !root.stopRequested)
+        root.switchToCompleted(payload.path)
+      root.refreshStatus()
+    }
+  }
+
+  // The helper needs a moment to create the partial file after it starts;
+  // until then mpv's open fails. Each failed attempt lands in handleMpvLine's
+  // end-file/error branch, which re-arms this timer up to streamRetries'
+  // bound (~6 s) before giving up for real.
+  Timer {
+    id: streamRetry
+    interval: 400
+    onTriggered: {
+      if (root.streamingId === "" || !root.currentTrack
+          || String(root.currentTrack.id) !== root.streamingId)
+        return
+      if (!streamProcess.running)
+        return // download over; its onExited decided what happens next
+      var path = String(root.currentTrack.streamPath || "")
+      if (path !== "")
+        root.startUrl("appending://" + path)
     }
   }
 
@@ -686,8 +1046,6 @@ Item {
     if (currentTrack && currentTrack.title)
       sendMpv(["set_property", "force-media-title", String(currentTrack.title)])
     trackStarted(currentTrack)
-    if (cacheOnPlay && currentTrack && !currentTrack.cached)
-      cacheTrack(currentTrack.id)
   }
 
   function togglePlayback() {
@@ -701,9 +1059,10 @@ Item {
   }
 
   function stop() {
-    if (!mpvRunning)
-      return
-    sendMpv(["stop"])
+    stopRequested = true
+    cleanupTransient("")
+    if (mpvRunning)
+      sendMpv(["stop"])
     fileLoaded = false
     playing = false
     buffering = false
@@ -803,6 +1162,11 @@ Item {
   readonly property int socketBudgetMs: 5000
   property int socketConnectAttempts: 0
 
+  // mpv is started with the user's own configuration and scripts on purpose,
+  // not --no-config: mpv-mpris loads as a script, and it is what makes media
+  // keys and other MPRIS clients work (README). Command-line options take
+  // precedence over mpv.conf, so nothing in a user's config can switch the
+  // two network-related flags below back on.
   function startMpv() {
     socketConnectAttempts = 0
     mpvProcess.command = [
@@ -812,6 +1176,15 @@ Item {
       "--no-terminal",
       "--force-window=no",
       "--keep-open=no",
+      // mpv only ever plays local files this plugin verified; the ytdl hook
+      // exists to fetch from the network and stays off.
+      "--ytdl=no",
+      // ...and a local file must not be able to send mpv to the network on
+      // its own either. Without this, a file that turns out to be an
+      // m3u/pls playlist makes mpv open the URLs inside it (verified: it
+      // connected to the host named in a planted partial-*.mp3), outside
+      // every allowlist the helper enforces.
+      "--access-references=no",
       "--volume=" + Math.round(volume * 100),
       "--cache=yes",
       "--input-ipc-server=" + socketPath
@@ -1020,6 +1393,12 @@ Item {
       fileLoaded = true
       buffering = false
       playing = true
+      if (pendingSeekSeconds > 0) {
+        // Resuming after the switch from the partial to the completed file.
+        positionSeconds = pendingSeekSeconds
+        sendMpv(["seek", pendingSeekSeconds, "absolute"])
+        pendingSeekSeconds = 0
+      }
       return
     }
     if (message.event === "end-file") {
@@ -1027,8 +1406,20 @@ Item {
       playing = false
       buffering = false
       positionSeconds = 0
-      if (message.reason === "error")
-        fail("Playback failed — the session could not be streamed")
+      if (message.reason === "error") {
+        // While a stream download is starting up, the partial file does not
+        // exist for the first few hundred milliseconds and mpv's open fails.
+        // That is expected — retry briefly before treating it as real.
+        if (streamingId !== "" && currentTrack
+            && String(currentTrack.id) === streamingId
+            && streamRetries < 15) {
+          streamRetries += 1
+          buffering = true
+          streamRetry.restart()
+          return
+        }
+        fail("Playback failed — the session could not be played")
+      }
       return
     }
 
@@ -1056,7 +1447,18 @@ Item {
   }
 
   Component.onDestruction: {
+    // Best effort: a Process cannot be started during teardown, so no group
+    // KILL escalation is possible here. TERM is enough in practice — mpv and
+    // the helper both exit on it — and every helper additionally carries its
+    // own --budget deadline, so even one that misses this signal ends itself.
     if (mpvProcess.running)
       mpvProcess.signal(15)
+    var procs = [statusProcess, loginProcess, favoritesProcess, favProcess,
+                 searchProcess, catalogProcess, resolveProcess, streamProcess,
+                 downloadProcess, actionProcess, artworkProcess]
+    for (var i = 0; i < procs.length; i++) {
+      if (procs[i].running)
+        procs[i].signal(15)
+    }
   }
 }

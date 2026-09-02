@@ -14,7 +14,19 @@ BarWidget {
 
   readonly property bool showTitle: setting("showTrackTitle", "On") === "On"
   readonly property real barTextCap: Number(setting("maxBarTextWidth", "220")) || 0
-  readonly property real volumeStep: Math.max(1, Number(setting("volumeStep", 5))) / 100
+  // Number() of a non-numeric setting is NaN, and Math.max(1, NaN) is NaN —
+  // one scroll would then make the volume NaN and the next mpv start would
+  // get "--volume=NaN" and exit. Clamp only a finite value; fall back
+  // otherwise.
+  readonly property real volumeStep: {
+    var step = Number(setting("volumeStep", 5))
+    return (isFinite(step) ? Math.min(25, Math.max(1, step)) : 5) / 100
+  }
+  readonly property var searchModes: ["keyword", "local", "ai", "frequency"]
+  readonly property string defaultSearchMode: {
+    var mode = String(setting("defaultSearchMode", "keyword"))
+    return searchModes.indexOf(mode) >= 0 ? mode : "keyword"
+  }
 
   property bool popupOpen: false
 
@@ -50,6 +62,8 @@ BarWidget {
     if (service) {
       service.repeat = setting("repeat", "Off") === "On"
       service.cacheOnPlay = setting("cacheOnPlay", "Off") === "On"
+      if (service.searchQuery === "")
+        service.searchMode = root.defaultSearchMode
     }
   }
 
@@ -135,6 +149,8 @@ BarWidget {
           Text {
             id: label
             anchors.verticalCenter: parent.verticalCenter
+            // The session title is remote input; render it literally.
+            textFormat: Text.PlainText
             text: root.barText
             color: button.foreground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -305,6 +321,7 @@ BarWidget {
 
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: root.service ? root.service.trackTitle : ""
             color: root.bar ? root.bar.foreground : Color.foreground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -316,6 +333,7 @@ BarWidget {
 
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: {
               if (!root.service || !root.service.currentTrack)
                 return ""
@@ -559,7 +577,8 @@ BarWidget {
             anchors.left: parent.left
             anchors.leftMargin: Style.spacing.sm
             anchors.verticalCenter: parent.verticalCenter
-            source: favRow.modelData.thumb || ""
+            // Local file from the Service's artwork cache, never remote.
+            source: root.service ? root.service.artUrl(favRow.modelData) : ""
             sourceSize.width: 52
             sourceSize.height: 52
             fillMode: Image.PreserveAspectCrop
@@ -586,6 +605,7 @@ BarWidget {
             anchors.right: favPlaying.left
             anchors.rightMargin: Style.spacing.md
             anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
             text: String(favRow.modelData.title || favRow.modelData.id || "")
             color: root.bar ? root.bar.foreground : Color.foreground
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -638,6 +658,8 @@ BarWidget {
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
           width: parent.width - openButton.width - Style.spacing.xl
+          // Errors and notes can quote server-supplied text; keep it literal.
+          textFormat: Text.PlainText
           text: root.service
             ? (root.service.lastError !== "" ? root.service.lastError
               : (root.service.statusMessage !== "" ? root.service.statusMessage

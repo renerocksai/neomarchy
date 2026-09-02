@@ -6,7 +6,10 @@ Stdlib only. Every command prints a single JSON object on stdout:
     {"ok": true,  ...}          success
     {"ok": false, "error": ..., "code": ...}   failure (exit status 1)
 
-The QML plugin never parses HTML or holds a credential; it only reads this.
+The QML plugin never parses HTML and never holds a credential; it only reads
+this. It also never hands a remote URL to another program: audio reaches mpv
+and artwork reaches Qt only as local files that this script fetched through
+its own allowlist-checking, size-capped downloader.
 """
 
 from __future__ import annotations
@@ -16,14 +19,16 @@ import difflib
 import getpass
 import html
 import http.cookiejar
+import io
 import json
 import os
 import re
 import signal
+import stat as stat_m
 import subprocess
 import sys
-import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,11 +44,11 @@ API = "https://neowake-webapp-328920627728.europe-west10.run.app/api"
 #
 # The audio hosts are pinned deliberately. A session's audio URL arrives inside
 # a JSON document served by the membership site, so it is remote input, and
-# without this it could point mpv or the downloader at any origin at all. Two
-# hosts are in use today. If neowake ever moves its audio somewhere else this
-# list is the one thing that needs changing — shipping a plugin update is cheap
-# and is the right way to widen the allowlist, rather than trusting whatever
-# host the server happens to name.
+# without this it could point the downloader at any origin at all. Two hosts
+# are in use today. If neowake ever moves its audio somewhere else this list is
+# the one thing that needs changing — shipping a plugin update is cheap and is
+# the right way to widen the allowlist, rather than trusting whatever host the
+# server happens to name.
 SITE_HOST = "app.neowake.de"
 API_HOST = "neowake-webapp-328920627728.europe-west10.run.app"
 PAGE_HOSTS = frozenset({SITE_HOST})
@@ -73,20 +78,24 @@ MAX_PAGE_BYTES = 8 << 20
 MAX_JSON_BYTES = 4 << 20        # search API answers; ~50 KB in practice
 MAX_ERROR_BYTES = 64 << 10      # only ever quoted back in a message
 MAX_CACHE_BYTES = 32 << 20      # our own JSON caches, re-read every run
+MAX_COOKIE_BYTES = 256 << 10    # cookies.txt; a real one is ~1 KB
+MAX_ART_BYTES = 4 << 20         # one cover image; measured covers are ~40-200 KB
 
 # Audio is the one large thing here, and this is a DISK ceiling, not a buffer:
-# download_audio streams the response to a temporary file 1 MiB at a time and
+# download_audio streams the response to a partial file 1 MiB at a time and
 # never holds the file in memory, so peak RSS for a download is that one chunk
 # regardless of how big the session is. A measured 90-minute session is 216 MB,
 # so 512 MB covers roughly a 3.5-hour session. It is deliberately generous
-# because the cost of being wrong is only a refused download, and it is only
-# ever reached when the user explicitly asks to keep a session offline.
+# because the cost of being wrong is only a refused download.
 MAX_AUDIO_BYTES = 512 << 20
 MAX_CATALOG_ITEMS = 5000        # the real catalog is ~500
 MAX_FAVORITES = 2000
 MAX_TRACKS = 200
 MAX_SEARCH_RESULTS = 200
 MAX_STRING = 2000               # any single string we keep from a response
+MAX_QUERY = 200                 # a search query, from the panel or the CLI
+MAX_DIR_ENTRIES = 10000         # how far a directory scan will ever walk
+MAX_ART_IDS = 20                # ids accepted by one `artwork` invocation
 
 # Post ids are numeric and slugs are lowercase kebab-case; both are used to
 # build URLs and filenames, so they are validated at every entry point.
@@ -108,6 +117,10 @@ LOCKED_PATH = "/account-gesperrt/"
 CATALOG_MAX_AGE = 7 * 24 * 3600
 FAVORITES_MAX_AGE = 300
 
+# A partial download nobody has written to for this long is dead — its writer
+# was SIGKILLed or the machine went down — and may be swept or reclaimed.
+STALE_PARTIAL_SECS = 3600
+
 
 def _xdg(var: str, default: str) -> Path:
     return Path(os.environ.get(var) or Path.home() / default).expanduser()
@@ -115,12 +128,16 @@ def _xdg(var: str, default: str) -> Path:
 
 STATE_DIR = _xdg("XDG_STATE_HOME", ".local/state") / "neowake"
 CONFIG_DIR = _xdg("XDG_CONFIG_HOME", ".config") / "neowake"
-COOKIE_FILE = STATE_DIR / "cookies.txt"
-CATALOG_FILE = STATE_DIR / "catalog.json"
-DETAIL_FILE = STATE_DIR / "details.json"
-FAVORITES_FILE = STATE_DIR / "favorites.json"
-CONFIG_FILE = CONFIG_DIR / "config.json"
 AUDIO_DIR = STATE_DIR / "audio"
+ARTWORK_DIR = STATE_DIR / "artwork"
+COOKIE_FILE = STATE_DIR / "cookies.txt"     # paths appear in messages only;
+CONFIG_FILE = CONFIG_DIR / "config.json"    # all I/O is dirfd-relative below
+
+COOKIE_NAME = "cookies.txt"
+CATALOG_NAME = "catalog.json"
+DETAIL_NAME = "details.json"
+FAVORITES_NAME = "favorites.json"
+CONFIG_NAME = "config.json"
 
 
 class NwError(Exception):
@@ -130,16 +147,110 @@ class NwError(Exception):
 
 
 # --------------------------------------------------------------------------
+# time budget
+# --------------------------------------------------------------------------
+
+# One absolute deadline for the whole run, set in main() from --budget. Every
+# network operation and every child process is given only the time that is
+# left, so a stuck DNS lookup or a wedged secret-tool cannot make this process
+# outlive the deadline its caller granted. The QML layer passes a budget a few
+# seconds under its own watchdog timeout, so the helper unwinds on its own —
+# running its `finally` blocks — before the watchdog ever has to signal it.
+
+DEADLINE = float("inf")
+
+
+def remaining() -> float:
+    return DEADLINE - time.monotonic()
+
+
+def net_timeout(cap: float = 30.0) -> float:
+    """Socket timeout for the next request: the cap, or what is left."""
+    left = remaining()
+    if left <= 0:
+        raise NwError("helper ran out of time", "timeout")
+    return min(cap, left)
+
+
+def run_child(argv: list[str], input_text: str | None = None,
+              cap: float = 30.0):
+    """Run a child program with a hard deadline and full TERM/KILL/reap.
+
+    The child inherits our process group on purpose: the QML watchdog kills
+    that whole group at its deadline, so nothing this helper starts can outlive
+    it even if the helper itself is SIGKILLed mid-wait. On our own unwind —
+    timeout, SIGTERM, any exception — the child gets TERM, a short grace, then
+    KILL, and is always reaped.
+    """
+    budget = min(cap, remaining())
+    if budget <= 0:
+        raise NwError(f"no time left to run {argv[0]}", "timeout")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if input_text is not None
+            else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise NwError(f"could not run {argv[0]}: {exc}", "exec") from exc
+    try:
+        out, err = proc.communicate(input_text, timeout=budget)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired as exc:
+        _end_child(proc)
+        raise NwError(f"{argv[0]} did not answer in time", "timeout") from exc
+    except BaseException:
+        # SIGTERM unwinding through communicate() lands here too, so the
+        # QML watchdog's TERM always takes the child down with us.
+        _end_child(proc)
+        raise
+
+
+def _end_child(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass                     # unkillable (D-state); nothing more to do
+
+
+# --------------------------------------------------------------------------
 # input validation and resource limits
 # --------------------------------------------------------------------------
 
 
+# C0 control characters (and DEL) have no business in a title, a category or an
+# error message; stripped at ingestion so they can never reach a Text element,
+# a terminal, or mpv's media-title property.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def clip(value, limit: int = MAX_STRING) -> str:
-    """Coerce a value from a response into a string of bounded length."""
+    """Coerce a value from a response into a bounded, control-free string."""
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
-    return text[:limit]
+    return _CTRL_RE.sub(" ", text)[:limit]
+
+
+def display_text(value, limit: int = MAX_STRING) -> str:
+    """A string destined for the UI, decoded and bounded.
+
+    The QML renders everything as PlainText, so HTML entities the API left in
+    ("&#8211;", "&#038;") must be decoded here or they show up literally.
+    Decoding happens between two clips: the first bounds what unescape has to
+    chew on, the second re-bounds the result.
+    """
+    return clip(html.unescape(clip(value)), limit)
 
 
 def bounded(items, limit: int) -> list:
@@ -147,6 +258,40 @@ def bounded(items, limit: int) -> list:
     if not isinstance(items, (list, tuple)):
         return []
     return list(items[:limit])
+
+
+def display_list(items, limit: int, each: int = 200) -> list[str]:
+    """A list of short display strings from a response, or []."""
+    out = []
+    for value in bounded(items, limit):
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            continue
+        text = display_text(value, each).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def display_field(value, limit: int = 200) -> str | None:
+    """One bounded display string from a scalar or a short list, or None.
+
+    The search API is free-form JSON, so a field the UI will print as text
+    is coerced here: a list becomes a comma-joined line, a number its text,
+    and anything nested or boolean is dropped rather than rendered as
+    "[object Object]".
+    """
+    if isinstance(value, (list, tuple)):
+        return ", ".join(display_list(value, 8, limit)) or None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    return display_text(value, limit).strip() or None
+
+
+def number_or_none(value, limit: float = 1e6) -> int | float | None:
+    """A plain finite number within [0, limit] from a response, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if 0 <= value <= limit else None
 
 
 def valid_id(value) -> str:
@@ -179,6 +324,12 @@ def check_url(url: str, allowed: frozenset[str], what: str) -> str:
     text = "" if url is None else str(url)
     if len(text) > 2048:
         raise NwError(f"{what} url is implausibly long", "url")
+    # urlsplit silently strips tabs and newlines while urllib keeps them, so
+    # a URL with either would be checked as one string and requested as
+    # another. Neither has any business in a URL; refuse rather than parse.
+    if " " in text or _CTRL_RE.search(text):
+        raise NwError(f"{what} url contains whitespace or control characters",
+                      "url")
     try:
         parts = urllib.parse.urlsplit(text)
     except ValueError as exc:
@@ -198,8 +349,8 @@ def check_url(url: str, allowed: frozenset[str], what: str) -> str:
     # Compared case-folded and without a trailing dot. Not IDNA-normalised: a
     # Unicode homograph such as U+212A KELVIN SIGN folds to "k" and so passes
     # this check. It does not become a connection to another host — urllib's
-    # idna codec, Qt's ACE conversion and ffmpeg all fail to resolve the raw
-    # UTF-8 name — so this is a known sharp edge rather than a way through.
+    # idna codec fails to resolve the raw UTF-8 name — so this is a known
+    # sharp edge rather than a way through.
     host = (parts.hostname or "").lower().rstrip(".")
     if host not in allowed:
         raise NwError(f"{what} url points at unexpected host {host!r}", "url")
@@ -258,6 +409,181 @@ def declared_too_large(resp, limit: int) -> bool:
 
 
 # --------------------------------------------------------------------------
+# private state directories, held open by descriptor
+# --------------------------------------------------------------------------
+
+# Every read and write below goes through one of these held directory fds with
+# O_NOFOLLOW and descriptor-relative syscalls, so a path component swapped for
+# a symlink between check and use changes nothing: the check and the use are
+# the same open descriptor. The directories themselves are verified to be
+# real directories owned by this user, mode 0700.
+
+
+_DIR_FDS: dict[str, int] = {}
+
+
+def _open_verified_dir(path: Path) -> int:
+    try:
+        # 0700 from the first instant, not umask-then-fchmod: the fchmod
+        # below is for a directory that already existed with looser bits.
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise NwError(f"cannot create {path}: {exc}", "state") from exc
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                     | os.O_CLOEXEC)
+    except OSError as exc:
+        raise NwError(f"{path} is not a plain directory: {exc}", "state") from exc
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise NwError(f"{path} is not owned by this user", "state")
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+    except NwError:
+        os.close(fd)
+        raise
+    except OSError:
+        os.close(fd)
+        raise NwError(f"cannot secure {path}", "state")
+    return fd
+
+
+def _dir_fd(key: str, path: Path) -> int:
+    fd = _DIR_FDS.get(key)
+    if fd is None:
+        fd = _open_verified_dir(path)
+        _DIR_FDS[key] = fd
+    return fd
+
+
+def state_fd() -> int:
+    return _dir_fd("state", STATE_DIR)
+
+
+def config_fd() -> int:
+    return _dir_fd("config", CONFIG_DIR)
+
+
+def audio_fd() -> int:
+    state_fd()                     # parents first, so audio sits under ours
+    return _dir_fd("audio", AUDIO_DIR)
+
+
+def artwork_fd() -> int:
+    state_fd()
+    return _dir_fd("artwork", ARTWORK_DIR)
+
+
+def _verified_regular(fd: int, max_bytes: int, min_bytes: int = 0):
+    """fstat an open fd and accept only our own plain, unshared file."""
+    st = os.fstat(fd)
+    if (not stat_m.S_ISREG(st.st_mode)
+            or st.st_uid != os.geteuid()
+            or st.st_nlink != 1
+            or st.st_size > max_bytes
+            or st.st_size < min_bytes):
+        return None
+    return st
+
+
+def safe_read_bytes(dfd: int, name: str, cap: int) -> bytes | None:
+    """Read one of our own files, or None.
+
+    O_NOFOLLOW rejects a symlink planted at the name, O_NONBLOCK stops a FIFO
+    from hanging the open, and the fstat afterwards rejects anything that is
+    not a regular, singly-linked file owned by us and within the cap.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        return None
+    try:
+        if _verified_regular(fd, cap) is None:
+            return None
+        buf = bytearray()
+        while len(buf) <= cap:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                return bytes(buf)
+            buf += chunk
+        return None                # grew past the cap while we were reading
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def safe_write_bytes(dfd: int, name: str, data: bytes) -> None:
+    """Atomic write: exclusive random-named 0600 temp, fsync, rename.
+
+    Nothing here follows a path twice: the temp name is random, created with
+    O_EXCL so a pre-planted entry fails the create instead of being written
+    through, and both ends of the rename are relative to the held dirfd.
+    """
+    tmp = f".tmp-{os.urandom(8).hex()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                 0o600, dir_fd=dfd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    try:
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except OSError:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+
+def scan_dir_names(dfd: int, cap: int = MAX_DIR_ENTRIES) -> list[str]:
+    """Entry names of a held directory fd, never more than `cap` of them.
+
+    Enumerated through the same descriptor the caller will stat and unlink
+    through (os.scandir dups it), so the listing and the later per-name
+    syscalls are guaranteed to be about one and the same directory. The cap
+    is applied while iterating, before anything is materialised or sorted,
+    so a directory stuffed with entries costs at most `cap` names.
+    """
+    names: list[str] = []
+    try:
+        with os.scandir(dfd) as it:
+            for entry in it:
+                names.append(entry.name)
+                if len(names) >= cap:
+                    break
+    except OSError:
+        return []
+    return names
+
+
+def sweep_tmp(dfd: int, prefixes: tuple[str, ...]) -> None:
+    """Delete stale temporaries left behind by a killed or crashed run."""
+    cutoff = time.time() - STALE_PARTIAL_SECS
+    for name in scan_dir_names(dfd):
+        if not name.startswith(prefixes):
+            continue
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if stat_m.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                os.unlink(name, dir_fd=dfd)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # small json-file helpers
 # --------------------------------------------------------------------------
 
@@ -291,14 +617,19 @@ def read_details() -> dict:
     Entries on disk are not trustworthy just because we wrote them: they were
     produced by whatever version of this script ran last, from data the server
     supplied, and older versions did no URL checking at all. Validating only at
-    fetch time would leave every already-cached entry a way to hand mpv or Qt an
-    arbitrary URL, so the check is repeated here, on the read path that every
-    consumer goes through.
+    fetch time would leave every already-cached entry a way to hand the
+    downloader an arbitrary URL, so the check is repeated here, on the read
+    path that every consumer goes through.
 
     An entry whose audio URL no longer passes loses it and is re-resolved on
     demand; a bad thumb is simply dropped.
+
+    The schema is closed: only the keys resolve_detail/decorate_results write
+    are read back, each coerced to its shape, so an entry from an older
+    version (or a hand-edited file) can only ever contribute those fields —
+    every one of them is re-emitted to the QML side by playable().
     """
-    raw = read_json(DETAIL_FILE, {})
+    raw = read_json(DETAIL_NAME, {})
     if not isinstance(raw, dict):
         return {}
     out = {}
@@ -309,46 +640,68 @@ def read_details() -> dict:
             valid_id(key)
         except NwError:
             continue
-        clean = dict(detail)
-        audio = clean.get("audio")
-        if audio:
-            try:
-                clean["audio"] = check_url(audio, AUDIO_HOSTS, "audio")
-            except NwError:
-                clean.pop("audio", None)
-        clean["thumb"] = safe_thumb(clean.get("thumb"))
-        if clean.get("title"):
-            clean["title"] = clip(clean["title"])
-        out[key] = clean
+        out[key] = clean_detail(key, detail)
     return out
 
 
-def read_json(path: Path, default):
-    """Load one of our own caches, treating an oversized file as absent."""
+def clean_detail(post_id: str, detail: dict) -> dict:
+    """One details.json entry, rebuilt field by field from a trusted shape."""
+    clean: dict = {"id": post_id}
+    slug = detail.get("slug")
+    if isinstance(slug, str) and SLUG_RE.match(slug):
+        clean["slug"] = slug
+    for key in ("title", "artist"):
+        text = clip(detail.get(key)).strip()
+        if text:
+            clean[key] = text
+    if detail.get("titleSource") in ("page", "search"):
+        clean["titleSource"] = detail["titleSource"]
+    audio = detail.get("audio")
+    if audio:
+        try:
+            clean["audio"] = check_url(audio, AUDIO_HOSTS, "audio")
+        except NwError:
+            pass                    # re-resolved on demand
+    clean["thumb"] = safe_thumb(detail.get("thumb"))
+    url = detail.get("url")
+    if url:
+        try:
+            clean["url"] = check_url(url, PAGE_HOSTS, "session")
+        except NwError:
+            pass
+    clean["categories"] = display_list(detail.get("categories"), 50, 100)
+    for key in ("trackCount", "resolvedAt"):
+        number = number_or_none(detail.get(key), 1 << 40)
+        if number is not None:
+            clean[key] = int(number)
+    return clean
+
+
+def read_json(name: str, default, config: bool = False):
+    """Load one of our own caches; anything oversized or odd is just absent."""
+    dfd = config_fd() if config else state_fd()
+    raw = safe_read_bytes(dfd, name, MAX_CACHE_BYTES)
+    if raw is None:
+        return default
     try:
-        if path.stat().st_size > MAX_CACHE_BYTES:
-            return default
-        with path.open(encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
+        return json.loads(raw)
+    except ValueError:
         return default
 
 
-def write_json(path: Path, payload, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
-    os.chmod(tmp, mode)
-    tmp.replace(path)
+def write_json(name: str, payload, config: bool = False) -> None:
+    dfd = config_fd() if config else state_fd()
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    safe_write_bytes(dfd, name, body.encode("utf-8"))
 
 
 def load_config() -> dict:
-    return read_json(CONFIG_FILE, {})
+    cfg = read_json(CONFIG_NAME, {}, config=True)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def save_config(cfg: dict) -> None:
-    write_json(CONFIG_FILE, cfg, mode=0o600)
+    write_json(CONFIG_NAME, cfg, config=True)
 
 
 def config_user(cfg: dict | None = None) -> str | None:
@@ -369,36 +722,35 @@ KEYRING_ATTR_LEGACY = "email"
 
 
 def _secret_tool(verb: str, attr: str, user: str, password: str | None = None):
-    return subprocess.run(
+    """Returns (returncode, stdout, stderr); never blocks past the deadline."""
+    return run_child(
         ["secret-tool", verb]
         + (["--label=neowake membership password"] if verb == "store" else [])
         + ["service", KEYRING_SERVICE, "kind", "password", attr, user],
-        input=password,
-        text=True,
-        capture_output=True,
+        input_text=password,
+        cap=20.0,
     )
 
 
 def keyring_store(user: str, password: str) -> None:
-    proc = _secret_tool("store", KEYRING_ATTR, user, password)
-    if proc.returncode != 0:
+    code, _out, err = _secret_tool("store", KEYRING_ATTR, user, password)
+    if code != 0:
         raise NwError(
-            "could not store password in keyring: " + proc.stderr.strip(),
-            "keyring",
+            "could not store password in keyring: " + err.strip(), "keyring"
         )
 
 
 def keyring_lookup(user: str) -> str | None:
-    proc = _secret_tool("lookup", KEYRING_ATTR, user)
-    if proc.returncode == 0 and proc.stdout.strip("\n"):
-        return proc.stdout.strip("\n")
+    code, out, _err = _secret_tool("lookup", KEYRING_ATTR, user)
+    if code == 0 and out.strip("\n"):
+        return out.strip("\n")
 
-    legacy = _secret_tool("lookup", KEYRING_ATTR_LEGACY, user)
-    password = legacy.stdout.strip("\n") if legacy.returncode == 0 else ""
+    code, out, _err = _secret_tool("lookup", KEYRING_ATTR_LEGACY, user)
+    password = out.strip("\n") if code == 0 else ""
     if not password:
         return None
     # Migrate it forward so the entry stops claiming to be an email address.
-    if _secret_tool("store", KEYRING_ATTR, user, password).returncode == 0:
+    if _secret_tool("store", KEYRING_ATTR, user, password)[0] == 0:
         _secret_tool("clear", KEYRING_ATTR_LEGACY, user)
     return password
 
@@ -432,24 +784,84 @@ class Response:
         return LOCKED_PATH in self.url or "wp-login.php" in self.url
 
 
+_NETSCAPE_HEADER = (
+    "# Netscape HTTP Cookie File\n"
+    "# https://curl.se/rfc/cookie_spec.html\n"
+    "# This is a generated file!  Do not edit.\n\n"
+)
+
+
+def cookie_file_bytes(jar: http.cookiejar.CookieJar) -> bytes:
+    """The cookies.txt text MozillaCookieJar.save would write, as bytes.
+
+    Reproduced rather than called: the stdlib version can only open a
+    pathname, and every write in this file goes through a held dirfd. Same
+    seven tab-separated fields, same #HttpOnly_ prefix, so the stdlib loader
+    (_really_load) reads it back unchanged. Every cookie is kept — the
+    equivalent of ignore_discard/ignore_expires — because the membership
+    session cookie is a "discard" cookie that has to survive between runs.
+    """
+    lines = [_NETSCAPE_HEADER]
+    for cookie in jar:
+        # The format is tab-separated lines. A cookie the server managed to
+        # get a tab or a line break into would corrupt the file and make the
+        # loader reject every cookie after it, so such a cookie is left out.
+        if any(ch in (cookie.domain + cookie.path + cookie.name
+                      + (cookie.value or ""))
+               for ch in "\t\r\n"):
+            continue
+        domain = cookie.domain
+        if cookie.has_nonstandard_attr("HTTPOnly"):
+            domain = "#HttpOnly_" + domain
+        name, value = cookie.name, cookie.value
+        if value is None:
+            # cookies.txt regards 'Set-Cookie: foo' as a cookie with no name,
+            # whereas http.cookiejar regards it as a cookie with no value.
+            name, value = "", cookie.name
+        lines.append("\t".join([
+            domain,
+            "TRUE" if cookie.domain.startswith(".") else "FALSE",
+            cookie.path,
+            "TRUE" if cookie.secure else "FALSE",
+            "" if cookie.expires is None else str(cookie.expires),
+            name,
+            value,
+        ]) + "\n")
+    return "".join(lines).encode("utf-8")
+
+
 class Session:
     def __init__(self):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        self.jar = http.cookiejar.MozillaCookieJar(str(COOKIE_FILE))
-        if COOKIE_FILE.exists():
-            try:
-                self.jar.load(ignore_discard=True, ignore_expires=True)
-            except (OSError, http.cookiejar.LoadError):
-                pass
+        self.jar = http.cookiejar.MozillaCookieJar()
+        self._load_cookies()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar),
             AllowlistRedirectHandler,
         )
         self.opener.addheaders = []
 
+    def _load_cookies(self) -> None:
+        # Read through the verified-descriptor path, then parse from memory,
+        # so the cookie jar never opens a pathname of its own.
+        raw = safe_read_bytes(state_fd(), COOKIE_NAME, MAX_COOKIE_BYTES)
+        if raw is None:
+            return
+        try:
+            self.jar._really_load(
+                io.StringIO(raw.decode("utf-8", "replace")),
+                str(COOKIE_FILE), True, True,
+            )
+        except (http.cookiejar.LoadError, OSError, ValueError):
+            pass
+
     def save(self) -> None:
-        self.jar.save(ignore_discard=True, ignore_expires=True)
-        os.chmod(COOKIE_FILE, 0o600)
+        """Persist cookies through the same descriptor-relative atomic write
+        as every other file here. MozillaCookieJar.save can only open a
+        pathname — and re-resolves the whole path when it does — so the
+        cookies.txt text is produced in memory instead (cookie_file_bytes)
+        and handed to safe_write_bytes on the held state dirfd.
+        """
+        safe_write_bytes(state_fd(), COOKIE_NAME, cookie_file_bytes(self.jar))
 
     @property
     def logged_in(self) -> bool:
@@ -477,7 +889,7 @@ class Session:
         for key, value in (headers or {}).items():
             req.add_header(key, value)
         try:
-            with self.opener.open(req, timeout=timeout) as resp:
+            with self.opener.open(req, timeout=net_timeout(timeout)) as resp:
                 if declared_too_large(resp, limit):
                     raise NwError(f"{what} response is too large", "too-large")
                 return Response(resp.geturl(), resp.status,
@@ -488,10 +900,22 @@ class Session:
                             read_capped(exc, MAX_ERROR_BYTES, what))
         except urllib.error.URLError as exc:
             raise NwError(f"network error: {exc.reason}", "network") from exc
+        except OSError as exc:
+            # A timeout or reset mid-body arrives as a bare OSError, not as
+            # the URLError that wraps connect-time failures.
+            raise NwError(f"network error: {exc}", "network") from exc
 
     # -- authentication ---------------------------------------------------
 
-    def login(self, user: str, password: str, otp: str | None = None) -> dict:
+    def login(self, user: str, password: str) -> dict:
+        """Username/email + password against wp-login.php; nothing else.
+
+        neowake has never offered a second factor, so none is modelled here:
+        the only credentials this client handles are the two above, and the
+        password is the only one that is a secret (it arrives on stdin, never
+        on the command line). Should the site ever add 2FA, that is a plugin
+        update built against the real page, not a heuristic shipped in advance.
+        """
         # wp-login.php sets the test cookie WordPress insists on seeing back.
         self.request(f"{SITE}/wp-login.php")
 
@@ -503,8 +927,6 @@ class Session:
             "testcookie": "1",
             "wp-submit": "Anmelden",
         }
-        if otp:
-            form["wfls-token"] = otp
         resp = self.request(f"{SITE}/wp-login.php", data=form)
 
         if self.logged_in:
@@ -512,9 +934,6 @@ class Session:
             return {"state": "ok"}
 
         body = resp.text
-        if "wfls-token" in body or "wordfence" in body.lower():
-            return {"state": "otp-required"}
-
         match = re.search(
             r'id="login_error"[^>]*>(.*?)</div>', body, re.S | re.I
         )
@@ -522,7 +941,7 @@ class Session:
         if match:
             reason = re.sub(r"<[^>]+>", " ", match.group(1))
             reason = html.unescape(reason)
-            reason = re.sub(r"\s+", " ", reason).strip()
+            reason = clip(re.sub(r"\s+", " ", reason).strip(), 400)
         return {"state": "failed", "reason": reason}
 
     def ensure(self) -> None:
@@ -631,8 +1050,8 @@ class CatalogParser(HTMLParser):
             src = clip(attrs.get("data-lazysrc") or attrs.get("src") or "")
             if src and "25x25" not in src:
                 # Scraped straight out of the listing HTML, so it gets the same
-                # allowlist as any other remote URL — this one ends up as an
-                # Image source in the bar and the panel.
+                # allowlist as any other remote URL — this one is what the
+                # `artwork` command will later fetch to a local file.
                 self._current["thumb"] = safe_thumb(src)
 
     def handle_endtag(self, tag):
@@ -702,6 +1121,8 @@ def build_catalog(session: Session) -> dict:
     scanned = 0
 
     for path in discover_index_pages(session):
+        if remaining() < 10:
+            break               # keep what we have; finish inside the budget
         try:
             body = session.get_page(path).text
         except NwError:
@@ -739,12 +1160,63 @@ def build_catalog(session: Session) -> dict:
         "pagesScanned": scanned,
         "sessions": sorted(merged.values(), key=lambda i: i["title"].lower()),
     }
-    write_json(CATALOG_FILE, catalog)
+    write_json(CATALOG_NAME, catalog)
     return catalog
 
 
+def read_catalog() -> dict | None:
+    """Load catalog.json through a closed schema, or None if there is none.
+
+    Same reasoning as read_details: the file is ours, but it was written by
+    whatever version ran last, and every entry is re-emitted to the QML side
+    (search results, favorites) and consulted for URLs and ids. Each session
+    is rebuilt from the fields build_catalog writes, each coerced; anything
+    else in an entry is dropped, and an entry without a valid id and slug is
+    skipped.
+    """
+    raw = read_json(CATALOG_NAME, None)
+    if not isinstance(raw, dict):
+        return None
+    sessions = []
+    for item in bounded(raw.get("sessions"), MAX_CATALOG_ITEMS):
+        clean = clean_catalog_item(item)
+        if clean is not None:
+            sessions.append(clean)
+    fetched = number_or_none(raw.get("fetchedAt"), 1 << 40)
+    scanned = number_or_none(raw.get("pagesScanned"), MAX_INDEX_PAGES + 1)
+    return {
+        "fetchedAt": int(fetched or 0),
+        "count": len(sessions),
+        "pagesScanned": int(scanned or 0),
+        "sessions": sessions,
+    }
+
+
+def clean_catalog_item(item) -> dict | None:
+    """One catalogue session, rebuilt field by field, or None."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        post_id = valid_id(item.get("id"))
+    except NwError:
+        return None
+    slug = item.get("slug")
+    if not (isinstance(slug, str) and SLUG_RE.match(slug)):
+        return None
+    return {
+        "id": post_id,
+        "slug": slug,
+        "thumb": safe_thumb(item.get("thumb")),
+        "categories": display_list(item.get("categories"), 50, 100),
+        "durationHint": display_field(item.get("durationHint"), 40),
+        "title": clip(item.get("title")).strip() or slug_to_title(slug),
+        "titleSource": item["titleSource"]
+                       if item.get("titleSource") in ("slug", "page") else "slug",
+    }
+
+
 def load_catalog(session: Session, refresh: bool = False) -> dict:
-    catalog = read_json(CATALOG_FILE, None)
+    catalog = read_catalog()
     stale = (
         catalog is None
         or refresh
@@ -769,7 +1241,7 @@ def catalog_index(catalog) -> dict:
     index = {}
     if not isinstance(catalog, dict):
         return index
-    for item in catalog.get("sessions") or []:
+    for item in bounded(catalog.get("sessions"), MAX_CATALOG_ITEMS):
         if not isinstance(item, dict):
             continue
         if item.get("id"):
@@ -803,7 +1275,7 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
     key = valid_key(key)
 
     details = read_details()
-    catalog = read_json(CATALOG_FILE, None)
+    catalog = read_catalog()
     index = catalog_index(catalog) if catalog else {}
 
     item = index.get(key)
@@ -843,7 +1315,7 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
     poster = clip(first.get("poster")).strip()
 
     # Both URLs come from the response body, so neither is trusted: the audio
-    # url goes to mpv and the downloader, the thumb into an Image source.
+    # url feeds the downloader, the thumb feeds the artwork fetcher.
     audio = check_url(html.unescape(clip(first["mp3"])), AUDIO_HOSTS, "audio")
     thumb = html.unescape(poster) if poster else None
     if thumb:
@@ -870,16 +1342,29 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
         "resolvedAt": int(time.time()),
     }
     details[post_id] = detail
-    write_json(DETAIL_FILE, details)
+    write_json(DETAIL_NAME, details)
     return detail
 
 
 def playable(detail: dict) -> dict:
-    """Prefer an offline copy when we have one."""
+    """How the QML layer may start this session. Local files only.
+
+    A cached copy plays directly. Anything else names the partial file that
+    `cache add` will stream the audio into, so the player can follow that
+    local file (mpv's appending:// mode) while the helper — the only thing
+    that ever talks to the CDN — downloads it behind the allowlist and the
+    byte caps. The remote URL is included for CLI users but the player never
+    consumes it.
+    """
     local = cached_path(detail["id"])
     out = dict(detail)
     out["cached"] = local is not None
-    out["playUrl"] = local.as_uri() if local else detail["audio"]
+    if local is not None:
+        out["playUrl"] = local.as_uri()
+    else:
+        out["playUrl"] = None
+        suffix = audio_suffix(detail.get("audio") or "")
+        out["streamPath"] = str(AUDIO_DIR / partial_name(detail["id"], suffix))
     return out
 
 
@@ -889,60 +1374,135 @@ def playable(detail: dict) -> dict:
 
 
 AUDIO_SUFFIXES = (".mp3", ".m4a", ".ogg", ".opus", ".wav")
+TRACK_RE = re.compile(
+    r"\A[0-9]{1,%d}(%s)\Z"
+    % (MAX_ID_LEN, "|".join(re.escape(s) for s in AUDIO_SUFFIXES))
+)
+
+
+def audio_suffix(url: str) -> str:
+    suffix = Path(urllib.parse.urlsplit(str(url)).path).suffix.lower()
+    return suffix if suffix in AUDIO_SUFFIXES else ".mp3"
+
+
+def partial_name(post_id: str, suffix: str) -> str:
+    return f"partial-{post_id}{suffix}"
+
+
+# What a playlist, a web page or an API error starts with. mpv recognises an
+# m3u/pls/xspf sitting under an .mp3 name and — playlist entries being "safe"
+# in its book — would open the URLs inside on the network, outside every
+# allowlist here. The player is started with --access-references=no, which is
+# the hard stop; this keeps such a file off the disk in the first place.
+_NOT_AUDIO_PREFIXES = (
+    b"#EXTM3U", b"[playlist]", b"<?xml", b"<!", b"<", b"{", b"http://",
+    b"https://",
+)
+
+
+def looks_like_text(head) -> bool:
+    """True when the first bytes of a download cannot be an audio container.
+
+    Every container we accept (MP3 raw frames or ID3v2, MP4/M4A, Ogg, WAV) has
+    a non-printable byte within its first 64; a playlist or a page is all
+    printable ASCII. A short head is judged on what there is.
+    """
+    head = bytes(head[:64]).lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head.startswith(_NOT_AUDIO_PREFIXES):
+        return True
+    return bool(head) and all(32 <= b < 127 or b in b"\t\r\n" for b in head)
 
 
 def cached_path(post_id: str) -> Path | None:
-    """Look for an offline copy by exact name.
+    """Look for an offline copy by exact name, and only accept the real thing.
 
     Deliberately not a glob: post_id reaches here from the public playSession
     IPC method, and a glob pattern would let a caller probe outside the id it
-    named. valid_id also rules out separators before we build the path.
+    named. The candidate is opened O_NOFOLLOW relative to the held audio
+    dirfd and must be our own regular, singly-linked, non-empty file — a
+    symlink or hardlink planted under a cache name is rejected, never returned
+    to the player.
     """
-    if not AUDIO_DIR.exists():
-        return None
-    # A lookup, so an id we would never have written is simply a miss. Raising
-    # here would turn one malformed search result into a failure of the whole
-    # search, and would make an unexpected file in the cache unremovable.
     try:
         post_id = valid_id(post_id)
+        afd = audio_fd()
     except NwError:
+        # A lookup, so an id we would never have written is simply a miss.
         return None
     for suffix in AUDIO_SUFFIXES:
-        path = AUDIO_DIR / f"{post_id}{suffix}"
+        name = f"{post_id}{suffix}"
         try:
-            if path.is_file() and path.stat().st_size > 0:
-                return path
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                         | os.O_CLOEXEC, dir_fd=afd)
         except OSError:
             continue
+        try:
+            if _verified_regular(fd, MAX_AUDIO_BYTES, min_bytes=1) is not None:
+                return AUDIO_DIR / name
+        finally:
+            os.close(fd)
     return None
 
 
 def sweep_partials() -> None:
     """Delete half-written downloads left behind by an earlier run.
 
-    The watchdog in the QML layer kills a helper that overruns its deadline, and
-    a caching download is the one operation big enough to hit that. The signal
-    handler installed in main() normally lets the `finally` in download_audio
-    unlink the temporary file, but a SIGKILL, a power cut or an older build all
-    leave one behind, where it shows up in `cache list` as a bogus track.
+    Only partials that nothing could still be writing: a live download touches
+    its partial with every chunk, so anything untouched for an hour is dead.
+    Several helper processes can run at once — the QML starts them
+    independently, and the user may run the CLI alongside — so sweeping fresh
+    partials would destroy an in-flight download.
     """
-    if not AUDIO_DIR.exists():
+    try:
+        afd = audio_fd()
+    except NwError:
         return
-    # Only sweep partials that nothing could still be writing. Several helper
-    # processes can run at once — the QML starts them independently, and the
-    # user may run the CLI alongside — so deleting every tmp* would let a
-    # `cache list` in a terminal destroy an in-flight download.
-    cutoff = time.time() - 3600
-    for path in AUDIO_DIR.glob("tmp*"):
+    sweep_tmp(afd, ("tmp", "partial-", ".tmp-"))
+
+
+def _same_inode(afd: int, name: str, st) -> bool:
+    try:
+        cur = os.stat(name, dir_fd=afd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (cur.st_ino, cur.st_dev) == (st.st_ino, st.st_dev)
+
+
+def claim_partial(afd: int, name: str) -> int:
+    """Exclusively create the partial file for one download.
+
+    O_EXCL means a pre-planted entry — file, symlink, anything — fails the
+    create instead of being written through. A leftover from a dead run is
+    reclaimed; a fresh one means another process is downloading this session
+    right now, and after a short wait (a superseded helper may be mid-unwind)
+    that is reported rather than fought over.
+    """
+    deadline = time.monotonic() + 2.0
+    for _ in range(50):
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-        except OSError:
+            return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                           | os.O_CLOEXEC, 0o600, dir_fd=afd)
+        except FileExistsError:
             pass
+        try:
+            st = os.stat(name, dir_fd=afd, follow_symlinks=False)
+        except OSError:
+            continue            # vanished between attempts; try again
+        if (not stat_m.S_ISREG(st.st_mode)
+                or time.time() - st.st_mtime > STALE_PARTIAL_SECS):
+            try:
+                os.unlink(name, dir_fd=afd)
+            except OSError:
+                pass
+            continue
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    raise NwError("this session is already being downloaded", "busy")
 
 
 def download_audio(session: Session, detail: dict) -> Path:
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    afd = audio_fd()
     sweep_partials()
     post_id = valid_id(detail["id"])
     existing = cached_path(post_id)
@@ -950,49 +1510,198 @@ def download_audio(session: Session, detail: dict) -> Path:
         return existing
 
     url = check_url(detail.get("audio"), AUDIO_HOSTS, "audio")
-    suffix = Path(urllib.parse.urlsplit(url).path).suffix.lower()
-    if suffix not in AUDIO_SUFFIXES:
-        suffix = ".mp3"
-    target = AUDIO_DIR / f"{post_id}{suffix}"
+    suffix = audio_suffix(url)
+    part = partial_name(post_id, suffix)
+    final = f"{post_id}{suffix}"
 
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     req.nw_allowed_hosts = AUDIO_HOSTS
     req.nw_what = "audio"
-    tmp = None
+
+    fd = claim_partial(afd, part)
+    ours = os.fstat(fd)
     try:
-        with session.opener.open(req, timeout=60) as resp:
-            if declared_too_large(resp, MAX_AUDIO_BYTES):
-                raise NwError("audio file is too large to cache", "too-large")
-            with tempfile.NamedTemporaryFile(
-                dir=AUDIO_DIR, delete=False
-            ) as handle:
-                tmp = Path(handle.name)
+        try:
+            with session.opener.open(req, timeout=net_timeout(60)) as resp:
+                if declared_too_large(resp, MAX_AUDIO_BYTES):
+                    raise NwError("audio file is too large to cache", "too-large")
                 written = 0
                 while True:
+                    if remaining() <= 0:
+                        raise NwError("download ran out of time", "timeout")
                     chunk = resp.read(1 << 20)
                     if not chunk:
                         break
+                    if written == 0 and looks_like_text(chunk):
+                        raise NwError(
+                            "audio url did not return an audio file",
+                            "not-audio",
+                        )
                     written += len(chunk)
                     if written > MAX_AUDIO_BYTES:
                         raise NwError(
                             "audio file is too large to cache", "too-large"
                         )
-                    handle.write(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(fd, view):]
+            if written == 0:
+                raise NwError("audio file arrived empty", "network")
+            os.fsync(fd)
+        except urllib.error.URLError as exc:
+            raise NwError(f"download failed: {exc.reason}", "network") from exc
+        except OSError as exc:
+            # Includes a socket timing out mid-read; disk errors land here too.
+            raise NwError(f"download failed: {exc}", "network") from exc
+        # Rename only the file we actually wrote. If another process judged
+        # our partial stale and reclaimed the name, the name is now its file,
+        # and renaming or deleting it would corrupt that download.
+        if not _same_inode(afd, part, ours):
+            raise NwError("download was superseded by another process", "busy")
         try:
-            tmp.replace(target)
+            os.rename(part, final, src_dir_fd=afd, dst_dir_fd=afd)
         except OSError as exc:
             raise NwError(f"download failed: {exc}", "io") from exc
-        tmp = None
-        return target
-    except urllib.error.URLError as exc:
-        raise NwError(f"download failed: {exc.reason}", "network") from exc
-    finally:
-        # Never leave a half-written file behind, whatever went wrong.
-        if tmp is not None:
+        return AUDIO_DIR / final
+    except BaseException:
+        # Never leave a half-written file behind, whatever went wrong —
+        # including the SIGTERM unwind when the QML watchdog or a supersession
+        # ends this download early. Only our own inode, for the reason above.
+        if _same_inode(afd, part, ours):
             try:
-                tmp.unlink()
+                os.unlink(part, dir_fd=afd)
             except OSError:
                 pass
+        raise
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# artwork
+# --------------------------------------------------------------------------
+
+
+# The QML layer never loads a remote image: Qt's image loader follows
+# redirects on its own, outside the allowlist, so covers are fetched here —
+# behind check_url on every hop and the byte cap — and handed over as plain
+# local files.
+
+# Only the formats neowake actually serves covers in (measured: JPEG, PNG,
+# WebP). Anything else — GIF, BMP, SVG, whatever a server might send — is
+# refused rather than handed to a Qt image decoder we never needed. And a
+# cover is accepted only once its declared dimensions are known and sane: a
+# 4 MB file may legitimately be a 768 px cover, but it may also declare
+# 30000 x 30000 px and be a decompression bomb aimed at the shell's decoder.
+MAX_ART_PIXELS = 16 << 20       # 4096 x 4096; measured covers are 559-768 px
+
+_JPEG_SOF = frozenset({
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+    0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+})
+
+
+def image_dimensions(body) -> tuple[int, int] | None:
+    """(width, height) from the header of a JPEG, PNG or WebP, else None."""
+    data = bytes(body)
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        # IHDR is required to be the first chunk.
+        return (int.from_bytes(data[16:20], "big"),
+                int.from_bytes(data[20:24], "big"))
+    if data.startswith(b"\xff\xd8\xff"):
+        # Walk the segments to the first start-of-frame marker.
+        pos = 2
+        while pos + 9 <= len(data):
+            if data[pos] != 0xFF:
+                return None
+            marker = data[pos + 1]
+            if marker == 0xFF:                      # fill byte
+                pos += 1
+                continue
+            if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+                pos += 2                            # standalone markers
+                continue
+            if marker in (0xD9, 0xDA):
+                return None                         # EOI/SOS before any frame
+            length = int.from_bytes(data[pos + 2:pos + 4], "big")
+            if length < 2:
+                return None
+            if marker in _JPEG_SOF:
+                return (int.from_bytes(data[pos + 7:pos + 9], "big"),
+                        int.from_bytes(data[pos + 5:pos + 7], "big"))
+            pos += 2 + length
+        return None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            return (1 + int.from_bytes(data[24:27], "little"),
+                    1 + int.from_bytes(data[27:30], "little"))
+        if chunk == b"VP8L":
+            bits = int.from_bytes(data[21:25], "little")
+            return 1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF)
+        if chunk == b"VP8 ":
+            return (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                    int.from_bytes(data[28:30], "little") & 0x3FFF)
+    return None
+
+
+def acceptable_image(body) -> bool:
+    dims = image_dimensions(body)
+    if dims is None:
+        return False
+    width, height = dims
+    return width > 0 and height > 0 and width * height <= MAX_ART_PIXELS
+
+
+def artwork_url_for(post_id: str) -> str | None:
+    """The cover URL our own caches know for this id — never caller-supplied."""
+    details = read_details()
+    thumb = details.get(post_id, {}).get("thumb")
+    if not thumb:
+        item = catalog_index(read_catalog()).get(post_id) or {}
+        thumb = item.get("thumb")
+    return safe_thumb(thumb)
+
+
+def fetch_artwork(session: Session, post_id: str, afd: int) -> str | None:
+    name = f"{post_id}.img"
+    # A cached cover passes the same checks as a fresh one on every use — it
+    # may have been written by a version that checked less, or by no version
+    # of this script at all.
+    existing = safe_read_bytes(afd, name, MAX_ART_BYTES)
+    if existing and acceptable_image(existing):
+        return str(ARTWORK_DIR / name)
+
+    url = artwork_url_for(post_id)
+    if not url:
+        return None
+    try:
+        resp = session.request(url, allowed=IMAGE_HOSTS, limit=MAX_ART_BYTES,
+                               what="artwork", timeout=20)
+    except NwError:
+        return None
+    if resp.status != 200 or not acceptable_image(resp.body):
+        return None
+    try:
+        safe_write_bytes(afd, name, bytes(resp.body))
+    except (NwError, OSError):
+        return None
+    return str(ARTWORK_DIR / name)
+
+
+def cmd_artwork(session: Session, args) -> dict:
+    afd = artwork_fd()
+    sweep_tmp(afd, (".tmp-",))
+    out: dict[str, str | None] = {}
+    for raw in bounded(args.ids, MAX_ART_IDS):
+        try:
+            post_id = valid_id(raw)
+        except NwError:
+            continue
+        if remaining() < 5:
+            break
+        out[post_id] = fetch_artwork(session, post_id, afd)
+    return {"ok": True, "artwork": out}
 
 
 # --------------------------------------------------------------------------
@@ -1002,11 +1711,21 @@ def download_audio(session: Session, detail: dict) -> Path:
 
 def favorites_endpoints(session: Session) -> tuple[dict, dict]:
     resp = session.get_page("/favoriten/")
-    get_cfg = find_localized(resp.text, "CCC_MY_FAVORITE_GET")
-    update_cfg = find_localized(resp.text, "CCC_MY_FAVORITE_UPDATE")
-    if not get_cfg or not update_cfg:
-        raise NwError("could not find the favorites endpoints", "parse")
-    return get_cfg, update_cfg
+    out = []
+    for name in ("CCC_MY_FAVORITE_GET", "CCC_MY_FAVORITE_UPDATE"):
+        cfg = find_localized(resp.text, name)
+        # Three strings lifted out of the page's script: the endpoint (checked
+        # here and again by request()), the action name and the nonce.
+        if not isinstance(cfg, dict) or not all(
+                isinstance(cfg.get(k), str) and cfg[k]
+                for k in ("api", "action", "nonce")):
+            raise NwError("could not find the favorites endpoints", "parse")
+        out.append({
+            "api": check_url(clip(cfg["api"]), PAGE_HOSTS, "favorites api"),
+            "action": clip(cfg["action"], 200),
+            "nonce": clip(cfg["nonce"], 200),
+        })
+    return out[0], out[1]
 
 
 def favorite_ids(session: Session) -> list[str]:
@@ -1044,6 +1763,8 @@ def favorites_view(session: Session, ids: list[str]) -> list[dict]:
     for post_id in ids:
         if post_id in index or details.get(post_id, {}).get("audio"):
             continue
+        if remaining() < 10:
+            break
         try:
             details[post_id] = resolve_detail(session, post_id)
         except NwError:
@@ -1101,7 +1822,7 @@ def api_search(mode: str, query: str, user_id) -> list[dict]:
     req.nw_what = "search api"
     opener = urllib.request.build_opener(AllowlistRedirectHandler)
     try:
-        with opener.open(req, timeout=30) as resp:
+        with opener.open(req, timeout=net_timeout(30)) as resp:
             if declared_too_large(resp, MAX_JSON_BYTES):
                 raise NwError("search API response is too large", "too-large")
             data = json.loads(
@@ -1111,11 +1832,14 @@ def api_search(mode: str, query: str, user_id) -> list[dict]:
     except urllib.error.HTTPError as exc:
         detail = read_capped(exc, MAX_ERROR_BYTES, "search api")
         raise NwError(
-            f"search API {exc.code}: {detail.decode('utf-8', 'replace')[:200]}",
+            f"search API {exc.code}: "
+            + clip(detail.decode('utf-8', 'replace'), 200),
             "api",
         ) from exc
     except urllib.error.URLError as exc:
         raise NwError(f"network error: {exc.reason}", "network") from exc
+    except OSError as exc:
+        raise NwError(f"network error: {exc}", "network") from exc
     except ValueError as exc:
         raise NwError(f"search API returned malformed JSON: {exc}", "parse") from exc
 
@@ -1135,7 +1859,7 @@ def flatten_recommendations(data) -> list[dict]:
         return []
 
     out = []
-    for entry in data.get("recommendations") or []:
+    for entry in bounded(data.get("recommendations"), MAX_SEARCH_RESULTS):
         if not isinstance(entry, dict):
             continue
         session = dict(entry.get("sessionData") or {})
@@ -1144,7 +1868,7 @@ def flatten_recommendations(data) -> list[dict]:
         session["recommended"] = True
         out.append(session)
 
-    for session in data.get("additional_sessions") or []:
+    for session in bounded(data.get("additional_sessions"), MAX_SEARCH_RESULTS):
         if isinstance(session, dict) and session.get("id"):
             out.append(session)
     return out
@@ -1198,7 +1922,7 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
             post_id = valid_id(entry.get("id"))
         except NwError:
             continue
-        title = clip(entry.get("title")).strip()
+        title = display_text(entry.get("title")).strip()
         if not title:
             continue
         if post_id not in details and len(details) >= MAX_DETAIL_ENTRIES:
@@ -1209,7 +1933,7 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
             detail["titleSource"] = "search"
             learned = True
     if learned:
-        write_json(DETAIL_FILE, details)
+        write_json(DETAIL_NAME, details)
 
     out = []
     for entry in results:
@@ -1222,23 +1946,29 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
             continue
         item = index.get(post_id, {})
         detail = details.get(post_id, {})
+        # Every field below is either ours (catalogue/details) or coerced to a
+        # closed shape: the API's JSON is free-form and each of these lands in
+        # a Text element or an argument on the QML side.
         out.append(
             {
                 "id": post_id,
-                "title": entry.get("title") or detail.get("title") or item.get("title"),
+                "title": display_text(entry.get("title")).strip()
+                    or detail.get("title") or item.get("title"),
                 "slug": detail.get("slug") or item.get("slug"),
                 "thumb": detail.get("thumb") or item.get("thumb"),
-                "duration": entry.get("duration"),
-                "categories": entry.get("categories") or item.get("categories", []),
-                "shortDescription": entry.get("shortDescription"),
-                "reason": entry.get("reason"),
-                "recommended": entry.get("recommended", False),
-                "frequencies": entry.get("frequencies"),
-                "keywords": entry.get("keywords", [])[:8],
-                "headphonesRequired": entry.get("headphonesRequired"),
-                "score": entry.get("score"),
+                "duration": number_or_none(entry.get("duration")),
+                "categories": display_list(entry.get("categories"), 50, 100)
+                    or item.get("categories", []),
+                "shortDescription": display_field(entry.get("shortDescription"),
+                                                  MAX_STRING),
+                "reason": display_field(entry.get("reason"), MAX_STRING),
+                "recommended": entry.get("recommended") is True,
+                "frequencies": display_field(entry.get("frequencies")),
+                "keywords": display_list(entry.get("keywords"), 8),
+                "headphonesRequired": entry.get("headphonesRequired") is True,
+                "score": number_or_none(entry.get("score")),
                 "audio": detail.get("audio"),
-                "cached": cached_path(post_id) is not None if post_id else False,
+                "cached": cached_path(post_id) is not None,
             }
         )
     return out
@@ -1268,14 +1998,7 @@ def cmd_login(session: Session, args) -> dict:
     if not password:
         raise NwError("no password given", "usage")
 
-    result = session.login(user, password, otp=args.otp)
-
-    if result["state"] == "otp-required":
-        return {
-            "ok": True,
-            "state": "otp-required",
-            "message": "two-factor code required — rerun with --otp <code>",
-        }
+    result = session.login(user, password)
     if result["state"] != "ok":
         raise NwError(result.get("reason", "login failed"), "auth")
 
@@ -1308,8 +2031,10 @@ def discover_user_id(session: Session):
 def cmd_logout(session: Session, args) -> dict:
     cfg = load_config()
     user = config_user(cfg)
-    if COOKIE_FILE.exists():
-        COOKIE_FILE.unlink()
+    try:
+        os.unlink(COOKIE_NAME, dir_fd=state_fd())
+    except OSError:
+        pass
     if args.forget and user:
         keyring_clear(user)
         cfg.pop("username", None)
@@ -1318,11 +2043,32 @@ def cmd_logout(session: Session, args) -> dict:
     return {"ok": True, "forgot": bool(args.forget)}
 
 
+def _cached_track_names() -> list[str]:
+    """Names of complete offline copies: verified regular files, exact shape."""
+    try:
+        afd = audio_fd()
+    except NwError:
+        return []
+    names = []
+    for name in scan_dir_names(afd):
+        if not TRACK_RE.match(name):
+            continue
+        try:
+            st = os.stat(name, dir_fd=afd, follow_symlinks=False)
+        except OSError:
+            continue
+        if (stat_m.S_ISREG(st.st_mode) and st.st_uid == os.geteuid()
+                and st.st_nlink == 1 and st.st_size > 0):
+            names.append(name)
+        if len(names) >= MAX_CATALOG_ITEMS:
+            break
+    return names
+
+
 def cmd_status(session: Session, args) -> dict:
     cfg = load_config()
-    catalog = read_json(CATALOG_FILE, None)
+    catalog = read_catalog()
     user = config_user(cfg)
-    cached = list(AUDIO_DIR.glob("*")) if AUDIO_DIR.exists() else []
     return {
         "ok": True,
         "loggedIn": session.logged_in,
@@ -1331,11 +2077,9 @@ def cmd_status(session: Session, args) -> dict:
         "userId": cfg.get("userId"),
         "catalogCount": catalog.get("count") if catalog else 0,
         "catalogAge": int(time.time() - catalog["fetchedAt"]) if catalog else None,
-        # tmp* are partial downloads, not tracks — `cache list` filters them
-        # the same way, and the two counts should never disagree.
-        "cachedTracks": len([
-            p for p in cached if p.is_file() and not p.name.startswith("tmp")
-        ]),
+        # partial-*/tmp* are in-flight downloads, not tracks — `cache list`
+        # filters them the same way, and the two counts should never disagree.
+        "cachedTracks": len(_cached_track_names()),
     }
 
 
@@ -1351,17 +2095,19 @@ def cmd_catalog(session: Session, args) -> dict:
 
 
 def cmd_favorites(session: Session, args) -> dict:
-    cache = read_json(FAVORITES_FILE, None)
+    cache = read_json(FAVORITES_NAME, None)
     fresh = (
         cache is not None
         and not args.refresh
         and time.time() - cache.get("fetchedAt", 0) < FAVORITES_MAX_AGE
     )
     if fresh:
-        ids = cache["ids"]
+        ids = bounded(cache.get("ids"), MAX_FAVORITES)
+        ids = [i for i in ids if isinstance(i, str) and i.isdigit()
+               and len(i) <= MAX_ID_LEN]
     else:
         ids = favorite_ids(session)
-        write_json(FAVORITES_FILE, {"fetchedAt": int(time.time()), "ids": ids})
+        write_json(FAVORITES_NAME, {"fetchedAt": int(time.time()), "ids": ids})
     return {"ok": True, "count": len(ids), "favorites": favorites_view(session, ids)}
 
 
@@ -1375,14 +2121,17 @@ def cmd_fav(session: Session, args) -> dict:
     elif args.action == "toggle":
         ids.remove(post_id) if post_id in ids else ids.append(post_id)
     set_favorite_ids(session, ids)
-    write_json(FAVORITES_FILE, {"fetchedAt": int(time.time()), "ids": ids})
+    write_json(FAVORITES_NAME, {"fetchedAt": int(time.time()), "ids": ids})
     return {"ok": True, "favorite": post_id in ids, "count": len(ids)}
 
 
 def cmd_search(session: Session, args) -> dict:
-    query = " ".join(args.query).strip()
+    # Capped here as well as in the panel: local mode runs difflib over the
+    # whole catalogue per keystroke, and its cost scales with the query.
+    query = " ".join(args.query).strip()[:MAX_QUERY]
     if not query:
         raise NwError("empty query", "usage")
+    limit = max(1, min(MAX_SEARCH_RESULTS, args.limit))
 
     if args.mode == "local":
         catalog = load_catalog(session)
@@ -1390,7 +2139,7 @@ def cmd_search(session: Session, args) -> dict:
             "ok": True,
             "mode": "local",
             "query": query,
-            "results": local_search(catalog, query, args.limit),
+            "results": local_search(catalog, query, limit),
         }
 
     cfg = load_config()
@@ -1399,7 +2148,7 @@ def cmd_search(session: Session, args) -> dict:
         "ok": True,
         "mode": args.mode,
         "query": query,
-        "results": decorate_results(session, raw[: args.limit]),
+        "results": decorate_results(session, raw[:limit]),
     }
 
 
@@ -1412,22 +2161,24 @@ def cmd_resolve(session: Session, args) -> dict:
 
 def cmd_cache(session: Session, args) -> dict:
     if args.action == "list":
+        details = read_details()
+        sweep_partials()
         entries = []
-        if AUDIO_DIR.exists():
-            details = read_details()
-            sweep_partials()
-            for path in sorted(AUDIO_DIR.glob("*"))[:MAX_CATALOG_ITEMS]:
-                if not path.is_file() or path.name.startswith("tmp"):
-                    continue
-                post_id = path.stem
-                entries.append(
-                    {
-                        "id": post_id,
-                        "title": details.get(post_id, {}).get("title", post_id),
-                        "bytes": path.stat().st_size,
-                        "path": str(path),
-                    }
-                )
+        afd = audio_fd()
+        for name in sorted(_cached_track_names()):
+            post_id = Path(name).stem
+            try:
+                size = os.stat(name, dir_fd=afd, follow_symlinks=False).st_size
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "id": post_id,
+                    "title": details.get(post_id, {}).get("title", post_id),
+                    "bytes": size,
+                    "path": str(AUDIO_DIR / name),
+                }
+            )
         return {"ok": True, "count": len(entries), "tracks": entries}
 
     # Accepts an id or a slug. Cached files are named by post id, so a slug has
@@ -1435,7 +2186,7 @@ def cmd_cache(session: Session, args) -> dict:
     # silently reports success while removing nothing.
     post_id = valid_key(args.id)
     if not post_id.isdigit():
-        entry = catalog_index(read_json(CATALOG_FILE, None) or {}).get(post_id)
+        entry = catalog_index(read_catalog() or {}).get(post_id)
         if entry and entry.get("id"):
             post_id = valid_id(entry["id"])
     if args.action == "add":
@@ -1445,30 +2196,37 @@ def cmd_cache(session: Session, args) -> dict:
 
     path = cached_path(post_id)
     if path:
-        path.unlink()
+        try:
+            os.unlink(path.name, dir_fd=audio_fd())
+        except OSError:
+            path = None
     return {"ok": True, "id": post_id, "removed": bool(path)}
 
 
 def cmd_enrich(session: Session, args) -> dict:
     """Fill in real titles + audio urls for sessions we have not opened yet."""
+    limit = max(0, min(200, args.limit))
+    delay = max(0.0, min(5.0, args.delay))
     catalog = load_catalog(session)
     details = read_details()
     pending = [s for s in catalog["sessions"] if s["id"] not in details]
     done, failed = 0, 0
-    for item in pending[: args.limit]:
+    for item in pending[:limit]:
+        if remaining() < 15:
+            break
         try:
             resolve_detail(session, item["id"])
             done += 1
         except NwError:
             failed += 1
-        time.sleep(args.delay)
+        time.sleep(min(delay, max(0.0, remaining() - 10)))
     if done:
         build_catalog(session)
     return {
         "ok": True,
         "enriched": done,
         "failed": failed,
-        "remaining": max(0, len(pending) - args.limit),
+        "remaining": max(0, len(pending) - limit),
     }
 
 
@@ -1479,6 +2237,15 @@ def cmd_enrich(session: Session, args) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="neowake", description=__doc__)
+    parser.add_argument(
+        "--budget", type=float, default=3600.0,
+        help="hard wall-clock deadline for this run, in seconds "
+             "(clamped to 5..3600; the plugin passes one on every call)")
+    # The plugin passes this so one `kill -- -PID` from its watchdog takes the
+    # helper down together with anything the helper started. Off for terminal
+    # use, where leaving the shell's process group would break Ctrl+C.
+    parser.add_argument(
+        "--own-process-group", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("login", help="authenticate against app.neowake.de")
@@ -1486,7 +2253,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="neowake username (or the email you sign in with)")
     p.add_argument("--password-stdin", action="store_true",
                    help="read the password from the first line of stdin")
-    p.add_argument("--otp", help="two-factor code, when the site asks for one")
     p.add_argument("--no-store", action="store_true",
                    help="do not put the password in the keyring")
     p.set_defaults(func=cmd_login)
@@ -1520,7 +2286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_search)
 
-    p = sub.add_parser("resolve", help="post id or slug -> playable url")
+    p = sub.add_parser("resolve", help="post id or slug -> playable file")
     p.add_argument("id")
     p.add_argument("--download", action="store_true")
     p.add_argument("--force", action="store_true")
@@ -1530,6 +2296,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["add", "remove", "list"])
     p.add_argument("id", nargs="?")
     p.set_defaults(func=cmd_cache)
+
+    p = sub.add_parser("artwork",
+                       help="fetch cover art for the given post ids to "
+                            "local files, printing id -> path")
+    p.add_argument("ids", nargs="+")
+    p.set_defaults(func=cmd_artwork)
 
     p = sub.add_parser("enrich", help="backfill titles and audio urls")
     p.add_argument("--limit", type=int, default=25)
@@ -1543,11 +2315,22 @@ def on_terminate(signum, frame):
     """Turn SIGTERM into a normal unwind.
 
     Without this the default disposition kills the process outright and every
-    `finally` is skipped — including the one that removes a partly downloaded
-    file. The QML watchdog sends exactly this signal, so a slow download that
-    overruns its deadline would otherwise always leave an orphan behind.
+    `finally` is skipped — including the ones that remove a partly downloaded
+    file and end a running child process. The QML watchdog sends exactly this
+    signal, so a download that overruns its deadline would otherwise always
+    leave an orphan behind.
     """
     raise SystemExit(143)
+
+
+def on_alarm(signum, frame):
+    """Backstop for the --budget deadline.
+
+    remaining() is checked at every voluntary point, so this only fires when
+    the process is wedged somewhere that never reaches one — and then it turns
+    into the same clean unwind as a timeout, `finally` blocks included.
+    """
+    raise NwError("helper deadline exceeded", "timeout")
 
 
 def emit(payload) -> None:
@@ -1563,16 +2346,38 @@ def emit(payload) -> None:
 
 
 def main(argv: list[str]) -> int:
+    global DEADLINE
     signal.signal(signal.SIGTERM, on_terminate)
     args = build_parser().parse_args(argv)
-    session = Session()
+    if args.own_process_group:
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+    budget = max(5.0, min(3600.0, args.budget))
+    DEADLINE = time.monotonic() + budget
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.alarm(int(budget) + 15)
     try:
+        session = Session()
         result = args.func(session, args)
     except NwError as exc:
         emit({"ok": False, "error": str(exc), "code": exc.code})
         return 1
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        # A bug, or a page shaped in a way nothing above anticipated. It still
+        # has to answer in the one shape the QML side parses; the traceback
+        # goes to stderr, where a bug report can pick it up.
+        traceback.print_exc()
+        emit({
+            "ok": False,
+            "error": f"internal error: {type(exc).__name__}: "
+                     + clip(str(exc), 200),
+            "code": "internal",
+        })
+        return 1
     emit(result)
     return 0
 

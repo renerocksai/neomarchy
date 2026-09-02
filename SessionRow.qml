@@ -9,6 +9,10 @@ BorderSurface {
   property var item: null
   property int rowIndex: -1
   property string subtitle: ""
+  // A local file:// URL from the Service's artwork cache, or "". Never a
+  // remote URL: Qt's image loader follows redirects outside any allowlist,
+  // so covers only ever reach an Image after the helper fetched them.
+  property string artSource: ""
   property bool selected: false
   property bool nowPlaying: false
   property bool favorite: false
@@ -67,7 +71,7 @@ BorderSurface {
         id: cover
         anchors.fill: parent
         anchors.margins: Style.space(2)
-        source: row.item && row.item.thumb ? row.item.thumb : ""
+        source: row.artSource
         sourceSize.width: 108
         sourceSize.height: 108
         fillMode: Image.PreserveAspectCrop
@@ -111,6 +115,8 @@ BorderSurface {
 
         Text {
           width: parent.width - (row.nowPlaying ? Style.space(18) : 0)
+          // Remote-sourced string: render literally, never as markup.
+          textFormat: Text.PlainText
           text: row.item ? String(row.item.title || row.item.id || "") : ""
           color: row.foreground
           font.family: row.fontFamily
@@ -122,6 +128,7 @@ BorderSurface {
 
       Text {
         width: parent.width
+        textFormat: Text.PlainText
         text: row.subtitle
         color: row.foreground
         font.family: row.fontFamily
