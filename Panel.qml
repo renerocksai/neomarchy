@@ -33,6 +33,7 @@ Item {
   function open(payloadJson) {
     opened = true
     if (service) {
+      service.artworkSearchActive = true
       service.refreshStatus()
       if (service.loggedIn)
         service.refreshFavorites(false)
@@ -79,10 +80,14 @@ Item {
   function close() {
     closingFromHost = true
     opened = false
+    if (service)
+      service.artworkSearchActive = false
     Qt.callLater(function() { root.closingFromHost = false })
   }
 
   function requestClose() {
+    if (service)
+      service.artworkSearchActive = false
     if (shell && typeof shell.hide === "function")
       shell.hide(pluginId)
     else
@@ -599,7 +604,8 @@ Item {
 
               width: list.width
               item: modelData
-              artSource: root.service ? root.service.artUrl(modelData) : ""
+              artSource: root.opened && root.service
+                ? root.service.artUrl(modelData) : ""
               rowIndex: index
               foreground: root.foreground
               accent: root.accent

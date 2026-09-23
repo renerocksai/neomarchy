@@ -1264,12 +1264,14 @@ def clean_title(raw: str) -> str:
     return title.strip()
 
 
-def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
-    """key is a post id or a slug. Returns audio url + metadata, cached.
+def resolve_detail(session: Session, key: str, force: bool = False,
+                   save: bool = True) -> dict:
+    """key is a post id or a slug. Return audio url + metadata.
 
     The Sonaar player feeds itself from a small JSON document that carries the
     CDN url, the real title and the cover — 600 bytes instead of the 370 KB
-    session page, so this is what we ask for.
+    session page, so this is what we ask for. Artwork lookups pass save=False
+    because they need only the poster and must not write shared metadata.
     """
     # key reaches here straight from the playSession IPC method.
     key = valid_key(key)
@@ -1341,8 +1343,9 @@ def resolve_detail(session: Session, key: str, force: bool = False) -> dict:
         "trackCount": len(tracks),
         "resolvedAt": int(time.time()),
     }
-    details[post_id] = detail
-    write_json(DETAIL_NAME, details)
+    if save:
+        details[post_id] = detail
+        write_json(DETAIL_NAME, details)
     return detail
 
 
@@ -1674,7 +1677,18 @@ def fetch_artwork(session: Session, post_id: str, afd: int) -> str | None:
 
     url = artwork_url_for(post_id)
     if not url:
-        return None
+        # The public search API returns titles but no artwork. Sessions absent
+        # from the catalog (many YouTube sessions) get their poster from the
+        # small playlist metadata document, without fetching audio. Artwork
+        # never writes details.json, so it cannot overwrite another helper's
+        # search or playback metadata with a stale read-modify-write snapshot.
+        try:
+            detail = resolve_detail(session, post_id, force=True, save=False)
+        except NwError:
+            return None
+        url = safe_thumb(detail.get("thumb"))
+        if not url:
+            return None
     try:
         resp = session.request(url, allowed=IMAGE_HOSTS, limit=MAX_ART_BYTES,
                                what="artwork", timeout=20)
@@ -1693,14 +1707,26 @@ def cmd_artwork(session: Session, args) -> dict:
     afd = artwork_fd()
     sweep_tmp(afd, (".tmp-",))
     out: dict[str, str | None] = {}
+    seen: set[str] = set()
     for raw in bounded(args.ids, MAX_ART_IDS):
         try:
             post_id = valid_id(raw)
         except NwError:
             continue
+        if post_id in seen:
+            continue
+        seen.add(post_id)
         if remaining() < 5:
             break
-        out[post_id] = fetch_artwork(session, post_id, afd)
+        try:
+            out[post_id] = fetch_artwork(session, post_id, afd)
+        except (NwError, OSError):
+            out[post_id] = None
+        except Exception as exc:
+            # Covers are optional. One malformed response must not discard
+            # successful covers for other ids in this invocation.
+            print(f"artwork {post_id}: {type(exc).__name__}", file=sys.stderr)
+            out[post_id] = None
     return {"ok": True, "artwork": out}
 
 
