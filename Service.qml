@@ -66,6 +66,7 @@ Item {
   property bool searchLoading: false
   property string searchQuery: ""
   property string searchMode: "keyword"
+  property bool artworkSearchActive: false
 
   property bool catalogRefreshing: false
 
@@ -91,6 +92,11 @@ Item {
   readonly property string trackArtUrl: currentTrack ? artUrl(currentTrack) : ""
   readonly property string trackId: currentTrack ? String(currentTrack.id || "") : ""
   readonly property bool currentIsFavorite: trackId !== "" && isFavorite(trackId)
+
+  onCurrentTrackChanged: pruneArtwork()
+  onFavoriteIdsChanged: pruneArtwork()
+  onSearchResultsChanged: pruneArtwork()
+  onArtworkSearchActiveChanged: pruneArtwork()
 
   // mpv's control socket, and the directory we put it in.
   //
@@ -518,6 +524,8 @@ Item {
       clearSearch()
       return
     }
+    // Rows from the previous query must not keep their artwork work queued.
+    searchResults = []
     if (searchProcess.running) {
       searchSuperseded = true
       supersedeHelper(searchProcess)
@@ -608,8 +616,60 @@ Item {
   // "" while unknown, and a request queued the first time an id shows up.
   property var artworkPaths: ({})     // id -> "file://..." or "" (none/failed)
   property var artworkPending: ({})   // ids queued or in flight this session
-  property var artworkQueue: []
+  property var artworkQueue: []       // {id, needsResolve, attempts}
   property var artworkBatch: []
+  property var artworkFailedAt: ({})  // retry on a later view, for active ids
+
+  function artworkWanted(id) {
+    if ((currentTrack && String(currentTrack.id) === id)
+        || favoriteIds[id] === true)
+      return true
+    if (artworkSearchActive && searchQuery !== "") {
+      for (var i = 0; i < searchResults.length; i++) {
+        if (String(searchResults[i].id) === id)
+          return true
+      }
+    }
+    return false
+  }
+
+  function pruneArtwork() {
+    var keep = {}
+    if (currentTrack)
+      keep[String(currentTrack.id)] = true
+    for (var fav in favoriteIds) {
+      if (favoriteIds[fav] === true)
+        keep[fav] = true
+    }
+    if (artworkSearchActive && searchQuery !== "") {
+      for (var i = 0; i < searchResults.length; i++)
+        keep[String(searchResults[i].id)] = true
+    }
+    var paths = {}, failed = {}, pending = {}, queue = []
+    for (var id in artworkPaths) {
+      if (keep[id] === true)
+        paths[id] = artworkPaths[id]
+    }
+    for (var id in artworkFailedAt) {
+      if (keep[id] === true)
+        failed[id] = artworkFailedAt[id]
+    }
+    for (var i = 0; i < artworkBatch.length; i++) {
+      // A still-running batch may become relevant again before it exits.
+      pending[artworkBatch[i].id] = true
+    }
+    for (var i = 0; i < artworkQueue.length; i++) {
+      var entry = artworkQueue[i]
+      if (keep[entry.id] === true) {
+        queue.push(entry)
+        pending[entry.id] = true
+      }
+    }
+    artworkQueue = queue
+    artworkPending = pending
+    artworkFailedAt = failed
+    artworkPaths = paths
+  }
 
   function artUrl(item) {
     if (!item)
@@ -618,28 +678,45 @@ Item {
     if (!/^[0-9]{1,32}$/.test(id))
       return ""
     var known = artworkPaths[id]
-    if (known !== undefined)
+    if (known !== undefined) {
+      if (known === "" && Date.now() - (artworkFailedAt[id] || 0) > 60000)
+        queueArtwork(id, !item.thumb)
       return known
-    // Only ask when our helper can know a cover for this id; the queue is
-    // filled from a binding, so the actual work is deferred out of it.
-    if (item.thumb)
-      queueArtwork(id)
+    }
+    // Search results can have a title without a thumb. The helper can obtain
+    // that metadata from the playlist endpoint without downloading audio.
+    // Defer the request out of this binding.
+    queueArtwork(id, !item.thumb)
     return ""
   }
 
-  function queueArtwork(id) {
-    if (artworkPending[id] === true || artworkQueue.length >= 100)
+  function queueArtwork(id, needsResolve) {
+    if (!artworkWanted(id) || artworkPending[id] === true
+        || artworkQueue.length >= 100)
       return
     artworkPending[id] = true
-    artworkQueue.push(id)
+    artworkQueue.push({ id: id, needsResolve: needsResolve, attempts: 0 })
     Qt.callLater(root.pumpArtwork)
   }
 
   function pumpArtwork() {
     if (artworkProcess.running || artworkQueue.length === 0)
       return
-    artworkBatch = artworkQueue.splice(0, 12)
-    artworkProcess.command = helperArgv(["artwork"].concat(artworkBatch),
+    // Missing thumbs need metadata as well as an image. Keep those calls in
+    // small batches so the helper's one absolute deadline covers every id.
+    var needsResolve = artworkQueue[0].needsResolve
+    var queued = []
+    while (artworkQueue.length > 0 && queued.length < (needsResolve ? 4 : 12)
+           && artworkQueue[0].needsResolve === needsResolve)
+      queued.push(artworkQueue.shift())
+    artworkBatch = queued
+    var ids = []
+    for (var i = 0; i < artworkBatch.length; i++) {
+      var id = artworkBatch[i].id
+      artworkBatch[i].attempts++
+      ids.push(id)
+    }
+    artworkProcess.command = helperArgv(["artwork"].concat(ids),
       helperTimeoutMs)
     artworkProcess.running = true
     root.guard(artworkProcess, "Artwork fetch")
@@ -656,12 +733,27 @@ Item {
       for (var known in root.artworkPaths)
         next[known] = root.artworkPaths[known]
       for (var i = 0; i < root.artworkBatch.length; i++) {
-        var id = root.artworkBatch[i]
+        var entry = root.artworkBatch[i]
+        var id = entry.id
+        if (!root.artworkWanted(id)) {
+          delete root.artworkPending[id]
+          continue
+        }
         var path = table[id]
-        // A failure is remembered as "" — no cover, no retry storm. Artwork
-        // is optional; there is deliberately no error banner for it.
-        next[id] = (typeof path === "string" && path.charAt(0) === "/")
-          ? "file://" + path : ""
+        if (typeof path === "string" && path.charAt(0) === "/") {
+          next[id] = "file://" + path
+          delete root.artworkPending[id]
+          delete root.artworkFailedAt[id]
+        } else if (entry.attempts < 2
+                   && root.artworkQueue.length < 100) {
+          // A short-lived network failure should not leave a permanent
+          // placeholder. Retry once, behind any other visible rows.
+          root.artworkQueue.push(entry)
+        } else {
+          next[id] = ""
+          delete root.artworkPending[id]
+          root.artworkFailedAt[id] = Date.now()
+        }
       }
       root.artworkPaths = next
       root.artworkBatch = []

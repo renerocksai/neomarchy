@@ -186,7 +186,7 @@ Local data lives in `~/.local/state/neowake/` (directories mode 700, files
 | `details.json` | resolved titles, covers and audio urls |
 | `favorites.json` | short-lived cache of the favorite ids |
 | `audio/` | offline copies (`partial-*` while downloading) |
-| `artwork/` | cover images, fetched by the helper |
+| `artwork/` | cover images, fetched by the helper; visible search results missing a cover resolve metadata in bounded groups |
 
 Your username is in `~/.config/neowake/config.json`; the password is only ever
 in the keyring.

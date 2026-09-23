@@ -578,7 +578,8 @@ BarWidget {
             anchors.leftMargin: Style.spacing.sm
             anchors.verticalCenter: parent.verticalCenter
             // Local file from the Service's artwork cache, never remote.
-            source: root.service ? root.service.artUrl(favRow.modelData) : ""
+            source: root.popupOpen && root.service
+              ? root.service.artUrl(favRow.modelData) : ""
             sourceSize.width: 52
             sourceSize.height: 52
             fillMode: Image.PreserveAspectCrop
