@@ -340,6 +340,8 @@ BarWidget {
               var track = root.service.currentTrack
               var cats = track.categories || []
               var parts = []
+              if (track.headphonesRequired === true)
+                parts.push("Headphones required")
               if (cats.length > 0)
                 parts.push(String(cats[0]).replace(/-/g, " "))
               if (track.cached)
@@ -552,6 +554,7 @@ BarWidget {
 
           readonly property bool current: root.service
             && root.service.trackId === String(modelData.id)
+          readonly property bool headphones: modelData.headphonesRequired === true
 
           width: favList.width
           height: Style.space(36)
@@ -603,7 +606,7 @@ BarWidget {
           Text {
             anchors.left: favArt.right
             anchors.leftMargin: Style.spacing.lg
-            anchors.right: favPlaying.left
+            anchors.right: favHeadphones.left
             anchors.rightMargin: Style.spacing.md
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
@@ -613,6 +616,30 @@ BarWidget {
             font.pixelSize: Style.font.bodySmall
             font.bold: favRow.current
             elide: Text.ElideRight
+          }
+
+          BorderSurface {
+            id: favHeadphones
+            anchors.right: favPlaying.left
+            anchors.rightMargin: favRow.headphones ? Style.spacing.md : 0
+            anchors.verticalCenter: parent.verticalCenter
+            visible: favRow.headphones
+            width: visible ? Style.space(20) : 0
+            height: Style.space(20)
+            radius: Style.cornerRadius
+            color: Style.normalFillFor(
+              root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal",
+              root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+            Accessible.name: "Headphones required"
+
+            Text {
+              anchors.centerIn: parent
+              text: "󰋋"
+              color: Color.accent
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.iconSmall
+            }
           }
 
           Text {
