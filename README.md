@@ -3,6 +3,12 @@
 Search, favorite and play [neowake](https://app.neowake.de/) sessions from the
 Omarchy status bar — without opening a browser.
 
+> **Update — 2026-09-23 (v0.3.1):** Search results can now resolve missing
+> preview artwork, including for YouTube sessions. Already installed? Run
+> `omarchy plugin update io.github.renerocksai.neomarchy` (or
+> `omarchy plugin update` for all git-managed plugins). `omarchy update` does
+> not update third-party plugins.
+
 ![The bar widget](docs/bar-widget.png)
 
 - **Bar widget** with the neowake mark, the running session's title, and a mini
