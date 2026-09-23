@@ -656,6 +656,8 @@ def clean_detail(post_id: str, detail: dict) -> dict:
             clean[key] = text
     if detail.get("titleSource") in ("page", "search"):
         clean["titleSource"] = detail["titleSource"]
+    if isinstance(detail.get("headphonesRequired"), bool):
+        clean["headphonesRequired"] = detail["headphonesRequired"]
     audio = detail.get("audio")
     if audio:
         try:
@@ -670,7 +672,7 @@ def clean_detail(post_id: str, detail: dict) -> dict:
         except NwError:
             pass
     clean["categories"] = display_list(detail.get("categories"), 50, 100)
-    for key in ("trackCount", "resolvedAt"):
+    for key in ("trackCount", "resolvedAt", "headphonesCheckedAt"):
         number = number_or_none(detail.get(key), 1 << 40)
         if number is not None:
             clean[key] = int(number)
@@ -1029,6 +1031,7 @@ class CatalogParser(HTMLParser):
                     "id": attrs["data-id"],
                     "slug": None,
                     "thumb": None,
+                    "headphonesRequired": None,
                     "categories": bounded(
                         self._categories(clip(attrs.get("class", ""))), 50
                     ),
@@ -1039,6 +1042,16 @@ class CatalogParser(HTMLParser):
 
         if tag == "li":
             self._depth += 1
+
+        # The Essential Grid card uses element 22 for its headphone SVG and
+        # element 21 for its speaker SVG. This is the site's own per-session
+        # indication, independent of words such as "binaural" in the title.
+        if tag == "div":
+            classes = clip(attrs.get("class", "")).split()
+            if "eg-kopfhrer-anzeige-playlist-element-22" in classes:
+                self._current["headphonesRequired"] = True
+            elif "eg-kopfhrer-anzeige-playlist-element-21" in classes:
+                self._current["headphonesRequired"] = False
 
         if tag == "a" and not self._current["slug"]:
             href = clip(attrs.get("href", ""))
@@ -1143,6 +1156,8 @@ def build_catalog(session: Session) -> dict:
                 for cat in item["categories"]:
                     if cat not in existing["categories"]:
                         existing["categories"].append(cat)
+                if existing["headphonesRequired"] is None:
+                    existing["headphonesRequired"] = item["headphonesRequired"]
 
     if not merged:
         raise NwError("no sessions found on any listing page", "parse")
@@ -1156,6 +1171,7 @@ def build_catalog(session: Session) -> dict:
 
     catalog = {
         "fetchedAt": int(time.time()),
+        "headphonesIndexed": True,
         "count": len(merged),
         "pagesScanned": scanned,
         "sessions": sorted(merged.values(), key=lambda i: i["title"].lower()),
@@ -1186,6 +1202,7 @@ def read_catalog() -> dict | None:
     scanned = number_or_none(raw.get("pagesScanned"), MAX_INDEX_PAGES + 1)
     return {
         "fetchedAt": int(fetched or 0),
+        "headphonesIndexed": raw.get("headphonesIndexed") is True,
         "count": len(sessions),
         "pagesScanned": int(scanned or 0),
         "sessions": sessions,
@@ -1206,6 +1223,9 @@ def clean_catalog_item(item) -> dict | None:
     return {
         "id": post_id,
         "slug": slug,
+        "headphonesRequired": item.get("headphonesRequired")
+                              if isinstance(item.get("headphonesRequired"), bool)
+                              else None,
         "thumb": safe_thumb(item.get("thumb")),
         "categories": display_list(item.get("categories"), 50, 100),
         "durationHint": display_field(item.get("durationHint"), 40),
@@ -1220,6 +1240,7 @@ def load_catalog(session: Session, refresh: bool = False) -> dict:
     stale = (
         catalog is None
         or refresh
+        or not catalog.get("headphonesIndexed")
         or time.time() - catalog.get("fetchedAt", 0) > CATALOG_MAX_AGE
     )
     if stale:
@@ -1796,6 +1817,55 @@ def favorites_view(session: Session, ids: list[str]) -> list[dict]:
         except NwError:
             pass
 
+    # Some favorites, especially YouTube sessions, are missing from every
+    # listing grid. Their session page often states "Kopfhörer: Notwendig" or
+    # "Nicht notwendig"; the search API supplies the flag when it does not.
+    # Cache the answer so opening the mini player stays quick.
+    learned = False
+    for post_id in ids:
+        item = index.get(post_id) or {}
+        detail = details.get(post_id) or {}
+        if isinstance(item.get("headphonesRequired"), bool):
+            continue
+        if isinstance(detail.get("headphonesRequired"), bool):
+            continue
+        if time.time() - detail.get("headphonesCheckedAt", 0) < CATALOG_MAX_AGE:
+            continue
+        if remaining() < 5:
+            break
+        requirement = None
+        checked = False
+        try:
+            requirement = page_headphones_requirement(
+                session.get_page(f"/?p={post_id}").text
+            )
+            checked = True
+        except NwError:
+            pass
+        if requirement is None:
+            title = detail.get("title") or item.get("title")
+            if title:
+                try:
+                    matches = api_search("keyword", title[:MAX_QUERY], None)
+                    requirement = next(
+                        (entry["headphonesRequired"] for entry in matches
+                         if str(entry.get("id")) == post_id
+                         and isinstance(entry.get("headphonesRequired"), bool)),
+                        None,
+                    )
+                    checked = True
+                except NwError:
+                    pass
+        if not checked:
+            continue
+        detail = details.setdefault(post_id, {"id": post_id})
+        detail["headphonesCheckedAt"] = int(time.time())
+        if requirement is not None:
+            detail["headphonesRequired"] = requirement
+        learned = True
+    if learned:
+        write_json(DETAIL_NAME, details)
+
     out = []
     for post_id in ids:
         item = index.get(post_id) or {}
@@ -1808,11 +1878,26 @@ def favorites_view(session: Session, ids: list[str]) -> list[dict]:
                 "thumb": detail.get("thumb") or item.get("thumb"),
                 "categories": item.get("categories", []),
                 "durationHint": item.get("durationHint"),
+                "headphonesRequired": item.get("headphonesRequired")
+                    if isinstance(item.get("headphonesRequired"), bool)
+                    else detail.get("headphonesRequired"),
                 "audio": detail.get("audio"),
                 "cached": cached_path(post_id) is not None,
             }
         )
     return out
+
+
+def page_headphones_requirement(body: str) -> bool | None:
+    """Read the session's explicit Kopfhörer line, if it has one."""
+    matches = re.findall(r"Kopfhörer\s*:\s*([^<\r\n]{1,100})", body, re.I)
+    for answer in reversed(matches):
+        answer = html.unescape(answer).strip().casefold()
+        if answer.startswith("nicht notwendig"):
+            return False
+        if answer.startswith("notwendig"):
+            return True
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1991,7 +2076,11 @@ def decorate_results(session: Session, results: list[dict]) -> list[dict]:
                 "recommended": entry.get("recommended") is True,
                 "frequencies": display_field(entry.get("frequencies")),
                 "keywords": display_list(entry.get("keywords"), 8),
-                "headphonesRequired": entry.get("headphonesRequired") is True,
+                "headphonesRequired": entry.get("headphonesRequired")
+                    if isinstance(entry.get("headphonesRequired"), bool)
+                    else (item.get("headphonesRequired")
+                          if isinstance(item.get("headphonesRequired"), bool)
+                          else detail.get("headphonesRequired")),
                 "score": number_or_none(entry.get("score")),
                 "audio": detail.get("audio"),
                 "cached": cached_path(post_id) is not None,

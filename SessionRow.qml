@@ -145,14 +145,24 @@ BorderSurface {
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.spacing.xs
 
-      Text {
+      BorderSurface {
         anchors.verticalCenter: parent.verticalCenter
         visible: row.headphones
-        text: "󰋋"
-        color: row.foreground
-        font.family: row.fontFamily
-        font.pixelSize: Style.font.iconSmall
-        opacity: 0.45
+        width: headphoneLabel.implicitWidth + Style.spacing.md * 2
+        height: Style.space(24)
+        radius: Style.cornerRadius
+        color: Style.normalFillFor(row.foreground, row.accent)
+        borderSpec: Border.controlSpec("normal", row.foreground, row.accent)
+
+        Text {
+          id: headphoneLabel
+          anchors.centerIn: parent
+          text: "󰋋  Headphones required"
+          color: row.accent
+          font.family: row.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
       }
 
       Button {
