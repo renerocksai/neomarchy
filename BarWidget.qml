@@ -618,28 +618,18 @@ BarWidget {
             elide: Text.ElideRight
           }
 
-          BorderSurface {
+          Text {
             id: favHeadphones
             anchors.right: favPlaying.left
             anchors.rightMargin: favRow.headphones ? Style.spacing.md : 0
             anchors.verticalCenter: parent.verticalCenter
             visible: favRow.headphones
-            width: visible ? Style.space(20) : 0
-            height: Style.space(20)
-            radius: Style.cornerRadius
-            color: Style.normalFillFor(
-              root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-            borderSpec: Border.controlSpec("normal",
-              root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+            width: visible ? implicitWidth : 0
+            text: "󰋋"
+            color: Color.accent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.icon
             Accessible.name: "Headphones required"
-
-            Text {
-              anchors.centerIn: parent
-              text: "󰋋"
-              color: Color.accent
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.iconSmall
-            }
           }
 
           Text {
