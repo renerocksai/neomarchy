@@ -104,10 +104,10 @@ Keys: `/` or `Ctrl+F` focus the search box, `↑`/`↓` (or `j`/`k`) move,
 closes the window.
 
 Each row has a heart (favorite, written back to your account) and a download
-arrow (keep the mp3 offline). Sessions marked by neowake as requiring
-headphones show a **Headphones required** badge. The bar popup marks those
-favorites with the same headphone icon. An absent badge does not mean that
-speakers are confirmed suitable when neowake has not classified a session.
+arrow (keep the mp3 offline). Sessions marked by neowake's web app as requiring
+headphones show a headphone icon in the full panel and bar popup. Hover over
+the icon for its meaning. An absent icon does not mean that speakers are
+confirmed suitable when neowake has not classified a session.
 
 ## Keybindings
 

@@ -629,7 +629,14 @@ BarWidget {
             color: Color.accent
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.icon
-            Accessible.name: "Headphones required"
+            Accessible.name: "Neowake website: headphones required"
+
+            HoverHandler { id: favoriteHeadphonesHover }
+            PanelToolTip {
+              visible: favRow.headphones && favoriteHeadphonesHover.hovered
+              text: "Neowake website: headphones required"
+              fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            }
           }
 
           Text {
