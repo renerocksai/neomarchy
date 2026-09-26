@@ -148,12 +148,18 @@ BorderSurface {
       Text {
         anchors.verticalCenter: parent.verticalCenter
         visible: row.headphones
-        text: "󰋋  Headphones required"
+        text: "󰋋"
         color: row.accent
         font.family: row.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-        Accessible.name: "Headphones required"
+        font.pixelSize: Style.font.icon
+        Accessible.name: "Neowake website: headphones required"
+
+        HoverHandler { id: headphonesHover }
+        PanelToolTip {
+          visible: row.headphones && headphonesHover.hovered
+          text: "Neowake website: headphones required"
+          fontFamily: row.fontFamily
+        }
       }
 
       Button {
