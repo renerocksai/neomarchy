@@ -3,8 +3,9 @@
 Search, favorite and play [neowake](https://app.neowake.de/) sessions from the
 Omarchy status bar — without opening a browser.
 
-> **Update — 2026-09-23 (v0.3.1):** Search results can now resolve missing
-> preview artwork, including for YouTube sessions. Already installed? Run
+> **Update — 2026-11-08 (v0.3.2):** The audio player now exits if its controlling
+> shell crashes or is killed, preventing orphaned playback that a restarted
+> panel cannot pause or stop. Already installed? Run
 > `omarchy plugin update io.github.renerocksai.neomarchy` (or
 > `omarchy plugin update` for all git-managed plugins). `omarchy update` does
 > not update third-party plugins.
@@ -44,6 +45,7 @@ Everything is already on a stock Omarchy box:
 |---|---|
 | `mpv` + `mpv-mpris` | playback and media-key integration |
 | `python3` | the `bin/neowake` helper (standard library only) |
+| `setpriv` (util-linux) | ties playback to the controlling shell's lifetime |
 | `secret-tool` (libsecret) | stores your password in the system keyring |
 
 ## Install
@@ -224,6 +226,16 @@ QML errors go to the journal:
 ```bash
 journalctl -t omarchy-shell -f
 ```
+
+Run the playback lifecycle regressions with:
+
+```bash
+python3 tests/test_player_lifecycle.py
+```
+
+These use isolated, offscreen Quickshell instances and real mpv players with
+null audio output. They cover transport controls, service reloads, a stalled
+shell, and abrupt shell termination without using your account or music.
 
 ## License
 

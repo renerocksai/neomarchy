@@ -1262,6 +1262,14 @@ Item {
   function startMpv() {
     socketConnectAttempts = 0
     mpvProcess.command = [
+      // QML teardown cannot run if the shell crashes or is killed. Ask the
+      // kernel to terminate mpv when its controlling shell dies as well.
+      // Check the original parent after arming the signal: the shell may
+      // already have exited before setpriv got scheduled. Both launchers exec
+      // their successor, so mpv remains the Process object's direct child.
+      "setpriv", "--pdeathsig", "TERM", "--",
+      "sh", "-c", '[ "$PPID" = "$1" ] || exit 0; shift; exec "$@"',
+      "neomarchy-mpv", String(Quickshell.processId),
       "mpv",
       "--idle=yes",
       "--no-video",
@@ -1539,10 +1547,10 @@ Item {
   }
 
   Component.onDestruction: {
-    // Best effort: a Process cannot be started during teardown, so no group
-    // KILL escalation is possible here. TERM is enough in practice — mpv and
-    // the helper both exit on it — and every helper additionally carries its
-    // own --budget deadline, so even one that misses this signal ends itself.
+    // Hot-reload can destroy this service while the shell itself stays alive,
+    // so it still needs an explicit TERM in addition to mpv's parent-death
+    // signal. A Process cannot be started during teardown for group KILL
+    // escalation; the helpers also carry their own --budget deadline.
     if (mpvProcess.running)
       mpvProcess.signal(15)
     var procs = [statusProcess, loginProcess, favoritesProcess, favProcess,
